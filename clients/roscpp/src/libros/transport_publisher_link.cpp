@@ -86,7 +86,8 @@ bool TransportPublisherLink::initialize(const ConnectionPtr& connection)
 
   if (connection_->getTransport()->requiresHeader())
   {
-    connection_->setHeaderReceivedCallback(boost::bind(&TransportPublisherLink::onHeaderReceived, this, _1, _2));
+		connection_->setHeaderReceivedCallback(
+		    boost::bind(&TransportPublisherLink::onHeaderReceived, this, _1, _2));
 
     SubscriptionPtr parent = parent_.lock();
 
@@ -96,7 +97,9 @@ bool TransportPublisherLink::initialize(const ConnectionPtr& connection)
     header["callerid"] = this_node::getName();
     header["type"] = parent->datatype();
     header["tcp_nodelay"] = transport_hints_.getTCPNoDelay() ? "1" : "0";
-    connection_->writeHeader(header, boost::bind(&TransportPublisherLink::onHeaderWritten, this, _1));
+
+		connection_->writeHeader(header,
+		    boost::bind(&TransportPublisherLink::onHeaderWritten, this, _1));
   }
   else
   {
@@ -125,7 +128,7 @@ void TransportPublisherLink::onHeaderWritten(const ConnectionPtr& conn)
 
 bool TransportPublisherLink::onHeaderReceived(const ConnectionPtr& conn, const Header& header)
 {
-  (void)conn;
+	(void) conn;
   ROS_ASSERT(conn == connection_);
 
   if (!setHeader(header))
@@ -229,7 +232,7 @@ void TransportPublisherLink::onRetryTimer(const ros::SteadyTimerEvent&)
       if (transport->connect(host, port))
       {
         ConnectionPtr connection(boost::make_shared<Connection>());
-        connection->initialize(transport, false, HeaderReceivedFunc());
+				connection->initialize(transport, false, HeaderReceivedFunc());
         initialize(connection);
 
         ConnectionManager::instance()->addConnection(connection);

@@ -113,9 +113,12 @@ void ServiceServerLink::clearCalls()
 
 bool ServiceServerLink::initialize(const ConnectionPtr& connection)
 {
+
   connection_ = connection;
   connection_->addDropListener(boost::bind(&ServiceServerLink::onConnectionDropped, this, _1));
-  connection_->setHeaderReceivedCallback(boost::bind(&ServiceServerLink::onHeaderReceived, this, _1, _2));
+
+	connection_->setHeaderReceivedCallback(
+	    boost::bind(&ServiceServerLink::onHeaderReceived, this, _1, _2));
 
   M_string header;
   header["service"] = service_name_;
@@ -124,7 +127,8 @@ bool ServiceServerLink::initialize(const ConnectionPtr& connection)
   header["persistent"] = persistent_ ? "1" : "0";
   header.insert(extra_outgoing_header_values_.begin(), extra_outgoing_header_values_.end());
 
-  connection_->writeHeader(header, boost::bind(&ServiceServerLink::onHeaderWritten, this, _1));
+	connection_->writeHeader(header,
+	    boost::bind(&ServiceServerLink::onHeaderWritten, this, _1));
 
   return true;
 }
@@ -328,6 +332,7 @@ void ServiceServerLink::processNextCall()
 
 bool ServiceServerLink::call(const SerializedMessage& req, SerializedMessage& resp)
 {
+
   CallInfoPtr info(boost::make_shared<CallInfo>());
   info->req_ = req;
   info->resp_ = &resp;

@@ -100,7 +100,7 @@ public:
    * \brief Return a string that details the type of transport (Eg. TCPROS)
    * \return The stringified transport type
    */
-  virtual const char* getType() = 0;
+	const virtual char* getType() = 0;
 
   typedef boost::function<void(const TransportPtr&)> Callback;
   /**

@@ -59,7 +59,7 @@ public:
    */
   void addConnection(const ConnectionPtr& connection);
 
-  void clear(Connection::DropReason reason);
+	void clear(Connection::DropReason reason);
 
   uint32_t getTCPPort();
   uint32_t getUDPPort();
@@ -67,10 +67,13 @@ public:
   const TransportTCPPtr& getTCPServerTransport() { return tcpserver_transport_; }
   const TransportUDPPtr& getUDPServerTransport() { return udpserver_transport_; }
 
+	// TODO (nmf) replace one for another
   void udprosIncomingConnection(const TransportUDPPtr& transport, Header& header);
+	void udprosIncomingConnection1(const TransportUDPPtr& transport,
+	  Header& header);
 
   void start();
-  void shutdown();
+	void shutdown();
 
 private:
   void onConnectionDropped(const ConnectionPtr& conn);
@@ -79,8 +82,13 @@ private:
   // thread may still be using them (or more likely their transport)
   void removeDroppedConnections();
 
+	// TODO (nmf) comment
+	void onConnectionAvailable(const ConnectionPtr& conn,
+	  const Header& header);
   bool onConnectionHeaderReceived(const ConnectionPtr& conn, const Header& header);
   void tcprosAcceptConnection(const TransportTCPPtr& transport);
+	// TODO (nmf) replace related + add comment
+	void tcprosAcceptConnection1(const TransportTCPPtr& transport);
 
   PollManagerPtr poll_manager_;
 

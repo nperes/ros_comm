@@ -48,11 +48,18 @@ void connectCallback(const ros::SingleSubscriberPublisher &pub, int msg_count, i
   test_roscpp::TestArray msg;
   for(int i = 0; i < msg_count; i++)
   {
+  	//TODO (nmf) remove debugs
+  	//std::cerr << "[publish_n_fast.cpp] connectCallback received\n";
+  	
     msg.counter = i;
     int j = min_size + (int) ((max_size - min_size) * (rand() / (RAND_MAX + 1.0)));
     msg.float_arr.resize(j);
     ROS_INFO("published message %d (%d bytes)\n",
              msg.counter, ros::serialization::Serializer<test_roscpp::TestArray>::serializedLength(msg));
+             
+             // TODO (nmf) remove debug
+   	//std::cerr << "[publish_n_fast.cpp] calling publish\n";
+   	
     pub.publish(msg);
   }
 }
@@ -73,8 +80,18 @@ main(int argc, char** argv)
   int min_size = atoi(argv[2]);
   int max_size = atoi(argv[3]);
 
+// TODO (nmf) remove debug
+	//std::cerr << "[publish_n_fast.cpp main()] calling advertise\n";
+	
   ros::Publisher pub_ = n.advertise<test_roscpp::TestArray>("roscpp/pubsub_test", msg_count, boost::bind(&connectCallback, _1, msg_count, min_size, max_size));
+  
+  // TODO (nmf) remove debug
+//  	std::cerr << "[publish_n_fast.cpp main()] calling spin()\n";
+
   ros::spin();
+  
+  // TODO (nmf) remove debug
+//    	std::cerr << "[publish_n_fast.cpp main()] main() done\n";
 
   return 0;
 }

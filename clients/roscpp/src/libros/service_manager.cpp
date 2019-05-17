@@ -234,9 +234,10 @@ ServicePublicationPtr ServiceManager::lookupServicePublication(const std::string
   return ServicePublicationPtr();
 }
 
-ServiceServerLinkPtr ServiceManager::createServiceServerLink(const std::string& service, bool persistent,
-                                             const std::string& request_md5sum, const std::string& response_md5sum,
-                                             const M_string& header_values)
+ServiceServerLinkPtr ServiceManager::createServiceServerLink(
+    const std::string& service, bool persistent,
+    const std::string& request_md5sum, const std::string& response_md5sum,
+    const M_string& header_values)
 {
 
   boost::recursive_mutex::scoped_lock shutdown_lock(shutting_down_mutex_);
@@ -247,22 +248,27 @@ ServiceServerLinkPtr ServiceManager::createServiceServerLink(const std::string& 
 
   uint32_t serv_port;
   std::string serv_host;
+	//XML-RPC to rosmaster
   if (!lookupService(service, serv_host, serv_port))
   {
     return ServiceServerLinkPtr();
   }
 
-  TransportTCPPtr transport(boost::make_shared<TransportTCP>(&poll_manager_->getPollSet()));
+	TransportTCPPtr transport(
+	    boost::make_shared<TransportTCP>(&poll_manager_->getPollSet()));
 
   // Make sure to initialize the connection *before* transport->connect()
   // is called, otherwise we might miss a connect error (see #434).
   ConnectionPtr connection(boost::make_shared<Connection>());
   connection_manager_->addConnection(connection);
-  connection->initialize(transport, false, HeaderReceivedFunc());
 
-  if (transport->connect(serv_host, serv_port))
+	connection->initialize(transport, false, HeaderReceivedFunc());
+
+	if (transport->connect(serv_host, serv_port))
   {
-    ServiceServerLinkPtr client(boost::make_shared<ServiceServerLink>(service, persistent, request_md5sum, response_md5sum, header_values));
+		ServiceServerLinkPtr client(
+		    boost::make_shared<ServiceServerLink>(service, persistent,
+		        request_md5sum, response_md5sum, header_values));
 
     {
       boost::mutex::scoped_lock lock(service_server_links_mutex_);

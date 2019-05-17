@@ -40,6 +40,7 @@ using namespace ros;
 
 bool service::exists(const std::string& service_name, bool print_failure_reason)
 {
+
   std::string mapped_name = names::resolve(service_name);
 
   std::string host;
@@ -47,7 +48,9 @@ bool service::exists(const std::string& service_name, bool print_failure_reason)
 
   if (ServiceManager::instance()->lookupService(mapped_name, host, port))
   {
-    TransportTCPPtr transport(boost::make_shared<TransportTCP>(static_cast<ros::PollSet*>(NULL), TransportTCP::SYNCHRONOUS));
+		TransportTCPPtr transport(
+		    boost::make_shared<TransportTCP>(static_cast<ros::PollSet*>(NULL),
+		        TransportTCP::SYNCHRONOUS));
 
     if (transport->connect(host, port))
     {
@@ -59,6 +62,7 @@ bool service::exists(const std::string& service_name, bool print_failure_reason)
       boost::shared_array<uint8_t> buffer;
       uint32_t size = 0;;
       Header::write(m, buffer, size);
+
       transport->write((uint8_t*)&size, sizeof(size));
       transport->write(buffer.get(), size);
       transport->close();

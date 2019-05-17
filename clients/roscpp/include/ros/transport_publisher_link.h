@@ -54,7 +54,6 @@ public:
   TransportPublisherLink(const SubscriptionPtr& parent, const std::string& xmlrpc_uri, const TransportHints& transport_hints);
   virtual ~TransportPublisherLink();
 
-  //
   bool initialize(const ConnectionPtr& connection);
 
   const ConnectionPtr& getConnection() { return connection_; }

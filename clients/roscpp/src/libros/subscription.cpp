@@ -442,8 +442,10 @@ void closeTransport(const TransportUDPPtr& trans)
   }
 }
 
-void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRpcValue& result)
+void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn,
+    XmlRpcValue& result)
 {
+
   boost::mutex::scoped_lock lock(shutdown_mutex_);
   if (shutting_down_ || dropped_)
   {
@@ -465,7 +467,8 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
   udp_transport = conn->getUDPTransport();
 
   XmlRpc::XmlRpcValue proto;
-  if(!XMLRPCManager::instance()->validateXmlrpcResponse("requestTopic", result, proto))
+	if (!XMLRPCManager::instance()->validateXmlrpcResponse("requestTopic", result,
+	  proto))
   {
   	ROSCPP_LOG_DEBUG("Failed to contact publisher [%s:%d] for topic [%s]",
               peer_host.c_str(), peer_port, name_.c_str());
@@ -475,14 +478,17 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
 
   if (proto.size() == 0)
   {
-  	ROSCPP_LOG_DEBUG("Couldn't agree on any common protocols with [%s] for topic [%s]", xmlrpc_uri.c_str(), name_.c_str());
+		ROSCPP_LOG_DEBUG(
+		  "Couldn't agree on any common protocols with [%s] for topic [%s]",
+		  xmlrpc_uri.c_str(), name_.c_str());
   	closeTransport(udp_transport);
   	return;
   }
 
   if (proto.getType() != XmlRpcValue::TypeArray)
   {
-  	ROSCPP_LOG_DEBUG("Available protocol info returned from %s is not a list.", xmlrpc_uri.c_str());
+		ROSCPP_LOG_DEBUG("Available protocol info returned from %s is not a list.",
+		  xmlrpc_uri.c_str());
   	closeTransport(udp_transport);
   	return;
   }
@@ -496,6 +502,7 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
   std::string proto_name = proto[0];
   if (proto_name == "TCPROS")
   {
+
     if (proto.size() != 3 ||
         proto[1].getType() != XmlRpcValue::TypeString ||
         proto[2].getType() != XmlRpcValue::TypeInt)
@@ -514,8 +521,10 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
       ConnectionPtr connection(boost::make_shared<Connection>());
       TransportPublisherLinkPtr pub_link(boost::make_shared<TransportPublisherLink>(shared_from_this(), xmlrpc_uri, transport_hints_));
 
-      connection->initialize(transport, false, HeaderReceivedFunc());
-      pub_link->initialize(connection);
+			//TODO(nmf) remove previous
+			connection->initialize(transport, false, HeaderReceivedFunc());
+
+			pub_link->initialize(connection);
 
       ConnectionManager::instance()->addConnection(connection);
 
@@ -552,6 +561,7 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
     memcpy(buffer.get(), &header_bytes[0], header_bytes.size());
     Header h;
     std::string err;
+
     if (!h.parse(buffer, header_bytes.size(), err))
     {
       ROSCPP_LOG_DEBUG("Unable to parse UDPROS connection header: %s", err.c_str());
@@ -568,13 +578,15 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
       return;
     }
 
-    TransportPublisherLinkPtr pub_link(boost::make_shared<TransportPublisherLink>(shared_from_this(), xmlrpc_uri, transport_hints_));
+		TransportPublisherLinkPtr pub_link(
+		  boost::make_shared<TransportPublisherLink>(shared_from_this(), xmlrpc_uri,
+		    transport_hints_));
     if (pub_link->setHeader(h))
     {
       ConnectionPtr connection(boost::make_shared<Connection>());
-      connection->initialize(udp_transport, false, NULL);
-      connection->setHeader(h);
-      pub_link->initialize(connection);
+			connection->initialize(udp_transport, false, HeaderReceivedFunc());
+			connection->setHeader(h);
+			pub_link->initialize(connection);
 
       ConnectionManager::instance()->addConnection(connection);
 
@@ -594,6 +606,8 @@ void Subscription::pendingConnectionDone(const PendingConnectionPtr& conn, XmlRp
   {
   	ROSCPP_LOG_DEBUG("Publisher offered unsupported transport [%s]", proto_name.c_str());
   }
+
+
 }
 
 uint32_t Subscription::handleMessage(const SerializedMessage& m, bool ser, bool nocopy, const boost::shared_ptr<M_string>& connection_header, const PublisherLinkPtr& link)

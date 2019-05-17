@@ -34,7 +34,7 @@
 namespace ros
 {
 
-ServiceClient::Impl::Impl() 
+ServiceClient::Impl::Impl()
   : is_shutdown_(false)
 { }
 
@@ -91,7 +91,10 @@ ServiceClient::ServiceClient(const std::string& service_name, bool persistent, c
 
   if (persistent)
   {
-    impl_->server_link_ = ServiceManager::instance()->createServiceServerLink(impl_->name_, impl_->persistent_, impl_->service_md5sum_, impl_->service_md5sum_, impl_->header_values_);
+
+		impl_->server_link_ = ServiceManager::instance()->createServiceServerLink(
+		    impl_->name_, impl_->persistent_, impl_->service_md5sum_,
+		    impl_->service_md5sum_, impl_->header_values_);
   }
 }
 
@@ -105,8 +108,10 @@ ServiceClient::~ServiceClient()
 
 }
 
-bool ServiceClient::call(const SerializedMessage& req, SerializedMessage& resp, const std::string& service_md5sum)
+bool ServiceClient::call(const SerializedMessage& req, SerializedMessage& resp,
+    const std::string& service_md5sum)
 {
+
   if (service_md5sum != impl_->service_md5sum_)
   {
     ROS_ERROR("Call to service [%s] with md5sum [%s] does not match md5sum when the handle was created ([%s])", impl_->name_.c_str(), service_md5sum.c_str(), impl_->service_md5sum_.c_str());
@@ -120,7 +125,9 @@ bool ServiceClient::call(const SerializedMessage& req, SerializedMessage& resp, 
   {
     if (!impl_->server_link_)
     {
-      impl_->server_link_ = ServiceManager::instance()->createServiceServerLink(impl_->name_, impl_->persistent_, service_md5sum, service_md5sum, impl_->header_values_);
+			impl_->server_link_ = ServiceManager::instance()->createServiceServerLink(
+			    impl_->name_, impl_->persistent_, service_md5sum, service_md5sum,
+			    impl_->header_values_);
 
       if (!impl_->server_link_)
       {
@@ -132,7 +139,9 @@ bool ServiceClient::call(const SerializedMessage& req, SerializedMessage& resp, 
   }
   else
   {
-    link = ServiceManager::instance()->createServiceServerLink(impl_->name_, impl_->persistent_, service_md5sum, service_md5sum, impl_->header_values_);
+		link = ServiceManager::instance()->createServiceServerLink(impl_->name_,
+		    impl_->persistent_, service_md5sum, service_md5sum,
+		    impl_->header_values_);
 
     if (!link)
     {

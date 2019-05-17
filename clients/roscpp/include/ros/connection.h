@@ -36,6 +36,7 @@
 #define ROSCPP_CONNECTION_H
 
 #include "ros/header.h"
+#include "ros/security/security_module.h"
 #include "common.h"
 
 #include <boost/signals2.hpp>
@@ -46,6 +47,7 @@
 #include <boost/enable_shared_from_this.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/recursive_mutex.hpp>
+#include <openssl/evp.h>
 
 #define READ_BUFFER_SIZE (1024*64)
 
@@ -55,17 +57,22 @@ namespace ros
 class Transport;
 typedef boost::shared_ptr<Transport> TransportPtr;
 class Connection;
-typedef boost::shared_ptr<Connection> ConnectionPtr;
-typedef boost::function<void(const ConnectionPtr&, const boost::shared_array<uint8_t>&, uint32_t, bool)> ReadFinishedFunc;
-typedef boost::function<void(const ConnectionPtr&)> WriteFinishedFunc;
 
+typedef boost::shared_ptr<Connection> ConnectionPtr;
+typedef boost::function<
+  void(const ConnectionPtr&, const boost::shared_array<uint8_t>&, uint32_t,
+    bool)> ReadFinishedFunc;
+typedef boost::function<void(const ConnectionPtr&)> WriteFinishedFunc;
 typedef boost::function<bool(const ConnectionPtr&, const Header&)> HeaderReceivedFunc;
+typedef boost::function<void(const ConnectionPtr&)> ConnectionAvailableFunc;
 
 /**
- * \brief Encapsulates a connection to a remote host, independent of the transport type
+ * \brief Encapsulates a connection to a remote host, independent of the
+ * transport type
  *
- * Connection provides automatic header negotiation, as well as easy ways of reading and writing
- * arbitrary amounts of data without having to set up your own state machines.
+ * Connection provides automatic header negotiation, as well as easy ways of
+ * reading and writing arbitrary amounts of data without having to set up your
+ * own state machines.
  */
 class ROSCPP_DECL Connection : public boost::enable_shared_from_this<Connection>
 {
@@ -75,43 +82,68 @@ public:
     TransportDisconnect,
     HeaderError,
     Destructing,
-  };
+	};
 
   Connection();
   ~Connection();
 
+	/**
+	 * \brief Initialize this connection, setting up internal state. Triggers a
+	 * read request to transport to read a connection header from transport if
+	 * header_func is defined and is_server is set.
+	 *
+	 * If header_func is defined, and tcpros is being used, this method will
+	 * secure the connection before allowing connection headers to be exchanged.
+	 * This involves exchanging security information with the other endpoint of
+	 * this connection.
+	 *
+	 * \note Guaranteed not to request any IO from transport until header_func is
+	 * defined, or one of setHeaderReceivedCallback or writeHeader methods are
+	 * called (this is taken to indicate the caller has already ensured transport
+	 * is ready for IO)
+	 *
+	 * \param transport Actual transport layer implementation
+	 * \param is_server Indicates whether this connection should passively wait
+	 * 		for requests
+	 * \param header_func Callback to handle the connection header read.
+	 */
+	void initialize(const TransportPtr& transport, bool is_server,
+	    const HeaderReceivedFunc& header_func);
   /**
-   * \brief Initialize this connection.
-   */
-  void initialize(const TransportPtr& transport, bool is_server, const HeaderReceivedFunc& header_func);
-  /**
-   * \brief Drop this connection.  Anything added as a drop listener through addDropListener will get called back when this connection has
-   * been dropped.
+	 * \brief Drop this connection. Anything added as a drop listener through
+	 * addDropListener will get called back when this connection has been
+	 * dropped.
    */
   void drop(DropReason reason);
-
   /**
    * \brief Returns whether or not this connection has been dropped
    */
   bool isDropped();
-
   /**
-   * \brief Returns true if we're currently sending a header error (and will be automatically dropped when it's finished)
+	 * \brief Returns true if we're currently sending a header error (and will
+	 * be automatically dropped when it's finished)
    */
   bool isSendingHeaderError() { return sending_header_error_; }
-
   /**
-   * \brief Send a header error message, of the form "error=<message>".  Drops the connection once the data has written successfully (or fails to write)
+	 * \brief Send a header error message, of the form "error=<message>".  Drops
+	 * the connection once the data has written successfully (or fails to write)
+	 *
    * \param error_message The error message
    */
   void sendHeaderError(const std::string& error_message);
   /**
    * \brief Send a list of string key/value pairs as a header message.
-   * \param key_vals The values to send.  Neither keys nor values can have any newlines in them
-   * \param finished_callback The function to call when the header has finished writing
+	 *
+	 * \note Under tcpros, a call to this method will be delayed until the
+	 * connection completes security steps.
+	 *
+	 * \param key_vals The values to send. Neither keys nor values can have any
+	 *  	newlines in them
+	 * \param finished_callback The function to call when the header has finished
+	 * 		writing
    */
-  void writeHeader(const M_string& key_vals, const WriteFinishedFunc& finished_callback);
-
+	void writeHeader(const M_string& key_vals,
+	    const WriteFinishedFunc& finished_callback);
   /**
    * \brief Read a number of bytes, calling a callback when finished
    *
@@ -142,9 +174,10 @@ public:
    * \param immediate Whether to immediately try to write as much data as possible to the socket or to pass
    * the data off to the server thread
    */
-  void write(const boost::shared_array<uint8_t>& buffer, uint32_t size, const WriteFinishedFunc& finished_callback, bool immedate = true);
+	void write(const boost::shared_array<uint8_t>& buffer, uint32_t size,
+	  const WriteFinishedFunc& finished_callback, bool immediate = true);
 
-  typedef boost::signals2::signal<void(const ConnectionPtr&, DropReason reason)> DropSignal;
+	typedef boost::signals2::signal<void(const ConnectionPtr&, DropReason reason)> DropSignal;
   typedef boost::function<void(const ConnectionPtr&, DropReason reason)> DropFunc;
   /**
    * \brief Add a callback to be called when this connection has dropped
@@ -154,9 +187,18 @@ public:
 
   /**
    * \brief Set the header receipt callback
+	 *
+	 * This method is expected to be called only once and the caller must ensure
+	 * that transport is properly initialized for IO. This method triggers an
+	 * (possibly deferred and non-blocking) attempt to read the connection header
+	 * from transport.
+	 *
+	 * \note Under tcpros, a call to this method will be delayed until the
+	 * connection completes security steps.
+	 *
+	 * \param func Callback that handles a received connection header.
    */
-  void setHeaderReceivedCallback(const HeaderReceivedFunc& func);
-
+	void setHeaderReceivedCallback(const HeaderReceivedFunc& func);
   /**
    * \brief Get the Transport associated with this connection
    */
@@ -165,10 +207,9 @@ public:
    * \brief Get the Header associated with this connection
    */
   Header& getHeader() { return header_; }
-
   /**
-   * \brief Set the Header associated with this connection (used with UDPROS, 
-   *        which receives the connection during XMLRPC negotiation).
+	 * \brief Set the Header associated with this connection (used with udpros,
+	 *  	which receives the connection header from XMLRPC negotiation).
    */
   void setHeader(const Header& header) { header_ = header; }
 
@@ -189,13 +230,90 @@ private:
    * or through an error in the connection (such as a remote disconnect)
    */
   void onDisconnect(const TransportPtr& transport);
-
-
+	/**
+	 * \brief Internal callback to handle actual connection-header write by the
+	 * underlying transport.
+	 */
   void onHeaderWritten(const ConnectionPtr& conn);
   void onErrorHeaderWritten(const ConnectionPtr& conn);
-  void onHeaderLengthRead(const ConnectionPtr& conn, const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
-  void onHeaderRead(const ConnectionPtr& conn, const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
-
+	void onHeaderLengthRead(const ConnectionPtr& conn,
+	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	void onHeaderRead(const ConnectionPtr& conn,
+	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	/**
+	 * \brief Writes the Diffie-Hellman public key elements to transport as part
+	 * 		of the DH key-exchange step.
+	 */
+	void writeDH(const boost::shared_array<uint8_t> dh_buffer,
+	    const uint32_t dh_size, const WriteFinishedFunc& finished_callback);
+	/**
+	 * \brief Handles the read of a (message/service) block lenght under a secure
+	 * connection.
+	 */
+	void onSecureBlockLengthRead(const ConnectionPtr& conn,
+	  const boost::shared_array<uint8_t> buffer, uint32_t size, bool success);
+	/**
+	 * \brief Handles the read of a (message/service) block data under a secure
+	 * connection.
+	 *
+	 * Under a secure connection, additional steps must be taken to retrieve the
+	 * actual data.
+	 */
+	void onSecureBlockRead(const ConnectionPtr& conn,
+	    const boost::shared_array<uint8_t> buffer, uint32_t size, bool success);
+	/**
+	 * \brief Function to call when the security header is written - security
+	 * headers are exchanged even before connection headers (applicable only
+	 * under tcpros)
+	 */
+	void onSecureConnectionHeaderWritten(const ConnectionPtr& conn);
+	/**
+	 * \brief Function to call when the actual security header is read - security
+	 * headers are exchanged even before connection headers (applicable only
+	 * under tcpros)
+	 */
+	void onSecureConnectionHeaderLengthRead(const ConnectionPtr& conn,
+	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	/**
+	 * \brief call back when security header length is read - security
+	 * headers are exchanged even before connection headers (applicable only
+	 * under tcpros)
+	 */
+	void onSecureConnectionHeaderRead(const ConnectionPtr& conn,
+	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	/**
+	 * \brief call back when security headers exchange (applicable only under
+	 * tcpros) completes.
+	 *
+	 * Delayed read and/or write of connection headers are triggered.
+	 */
+	void onConnectionSecured(const ConnectionPtr& conn);
+	/**
+	 * \brief Read size bytes from transport.
+	 */
+	void readSimple(uint32_t size, const ReadFinishedFunc& callback);
+	/**
+	 * \brief Read at least, size bytes from transport, under a secure connection.
+	 */
+	void readSecure(uint32_t size, const ReadFinishedFunc& callback);
+	/**
+	 * \brief Write size bytes from buffer to transport.
+	 */
+	void writeSimple(const boost::shared_array<uint8_t>& buffer, uint32_t size,
+	  const WriteFinishedFunc& finished_callback, bool immediate);
+	/**
+	 * \brief Write size bytes from buffer to transport, under a secure
+	 * connection.
+	 *
+	 * \note more than size bytes are likely to be written to transport so that
+	 * security-related information is included.
+	 */
+	void writeSecure(const boost::shared_array<uint8_t>& buffer, uint32_t size,
+	    const WriteFinishedFunc& finished_callback, bool immediate);
+	/**
+	 * \brief Initializes the exchange of security headers
+	 */
+	void secureConnection();
   /**
    * \brief Read data off our transport.  Also manages calling the read callback.  If there is any data to be read,
    * read() will read it until the fixed read buffer is filled.
@@ -206,7 +324,7 @@ private:
    */
   void writeTransport();
 
-  /// Are we a server?  Servers wait for clients to send a header and then send a header in response.
+	/// Are we a server?
   bool is_server_;
   /// Have we dropped?
   bool dropped_;
@@ -214,9 +332,14 @@ private:
   Header header_;
   /// Transport associated with us
   TransportPtr transport_;
-  /// Function that handles the incoming header
+	/// Handles the incoming header
   HeaderReceivedFunc header_func_;
 
+	/// Lock me when checking connection secure status before exchanging
+	/// connection headers and during connection secure status update
+	boost::recursive_mutex available_mutex_;
+	/// Indicates whether this connection is ready to call read/write methods
+	bool is_available;
   /// Read buffer that ends up being passed to the read callback
   boost::shared_array<uint8_t> read_buffer_;
   /// Amount of data currently in the read buffer, in bytes
@@ -233,6 +356,19 @@ private:
   /// 32-bit loads and stores are atomic on x86 and PPC... TODO: use a cross-platform atomic operations library
   /// to ensure this is done atomically
   volatile uint32_t has_read_callback_;
+	// // appropriate read method to call under this connection (simple/secure)
+	boost::function<void(uint32_t, const ReadFinishedFunc&)> read_func_;
+
+	// TODO(nmf) handle this differently? (ReadBuffer)
+	boost::shared_array<uint8_t> buffered_read_buffer_;
+	uint32_t buffered_read_size_;
+	uint32_t buffered_read_capacity_;
+	uint32_t buffered_read_offset_;
+
+	// stores off a callback of a pending call to read
+	ReadFinishedFunc read_pending_callback_;
+	// stores off the number of bytes requested by a pending call to read
+	uint32_t read_pending_size_;
 
   /// Buffer to write from
   boost::shared_array<uint8_t> write_buffer_;
@@ -251,18 +387,36 @@ private:
   /// 32-bit loads and stores are atomic on x86 and PPC... TODO: use a cross-platform atomic operations library
   /// to ensure this is done atomically
   volatile uint32_t has_write_callback_;
-
   /// Function to call when the outgoing header has finished writing
   WriteFinishedFunc header_written_callback_;
-
+	// appropriate write method to call under this connection (simple/secure)
+	boost::function<
+	  void(const boost::shared_array<uint8_t>&, uint32_t,
+	    const WriteFinishedFunc&, bool)> write_func_;
   /// Signal raised when this connection is dropped
   DropSignal drop_signal_;
-
   /// Synchronizes drop() calls
   boost::recursive_mutex drop_mutex_;
-
-  /// If we're sending a header error we disable most other calls
+	/// If we're sending a header error we disable most other calls
   bool sending_header_error_;
+
+	//// TODO(nmf) doc
+	SecurityModulePtr security_module_;
+
+	// TODO(nmf) handle this differently
+	//// handles received (public) peer key (during DH exchange); set if
+	//// we generated DH keys and a peer key is expected to complete DH exchange)
+	PeerKeyRetrievedFunc peer_key_retrieved_callback_;
+
+	/// triggers the proper read call to read a connection header; set by
+	/// setHeaderReceivedCallback(); called as soon as connection is
+	/// secured, or immediately if security does not apply (udpros)
+	boost::function<void()> read_header_func_;
+	// triggers the proper write call to write a connection header; set by
+	// writeHeader(); called as soon as connection is secured, or immediately
+	// if security does not apply (udpros)
+	boost::function<void()> write_header_func_;
+
 };
 typedef boost::shared_ptr<Connection> ConnectionPtr;
 

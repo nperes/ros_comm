@@ -45,6 +45,7 @@
 #include <test_roscpp/TestStringString.h>
 #include <test_roscpp/BadTestStringString.h>
 
+
 TEST(SrvCall, callSrv)
 {
   test_roscpp::TestStringString::Request req;
@@ -57,6 +58,8 @@ TEST(SrvCall, callSrv)
 
   ASSERT_STREQ(res.str.c_str(), "CASE_flip");
 }
+
+
 
 TEST(SrvCall, callSrvUnicode)
 {
@@ -94,6 +97,7 @@ TEST(SrvCall, callSrvMultipleTimes)
   ASSERT_STREQ(res.str.c_str(), "CASE_flip");
 }
 
+
 TEST(SrvCall, callSrvWithWrongType)
 {
   test_roscpp::BadTestStringString::Request req;
@@ -107,6 +111,7 @@ TEST(SrvCall, callSrvWithWrongType)
     ASSERT_FALSE(call_result);
   }
 }
+
 
 TEST(SrvCall, callSrvHandle)
 {
@@ -135,6 +140,8 @@ TEST(SrvCall, callSrvHandle)
 
   ASSERT_STREQ(res.str.c_str(), "CASE_flip");
 }
+
+
 
 TEST(SrvCall, callSrvPersistentHandle)
 {
@@ -165,6 +172,7 @@ TEST(SrvCall, callSrvPersistentHandle)
   ASSERT_STREQ(res.str.c_str(), "CASE_flip");
 }
 
+
 TEST(SrvCall, callSrvLongRunning)
 {
   test_roscpp::TestStringString::Request req;
@@ -189,6 +197,7 @@ TEST(SrvCall, callSrvWhichUnadvertisesInCallback)
   ASSERT_FALSE(ros::service::call("service_adv_unadv_in_callback", req, res));
 }
 
+
 TEST(SrvCall, handleValid)
 {
   test_roscpp::TestStringString::Request req;
@@ -211,6 +220,7 @@ TEST(SrvCall, handleValid)
   ASSERT_STREQ(res.str.c_str(), "CASE_flip");
 }
 
+
 TEST(SrvCall, waitForServiceTimeout)
 {
   ros::NodeHandle nh;
@@ -221,8 +231,8 @@ TEST(SrvCall, waitForServiceTimeout)
   ASSERT_FALSE(handle.waitForExistence(ros::Duration(1)));
 }
 
-int
-main(int argc, char** argv)
+
+int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);
 
@@ -230,8 +240,6 @@ main(int argc, char** argv)
   ros::NodeHandle nh;
 
   int ret = RUN_ALL_TESTS();
-
-
 
   return ret;
 }

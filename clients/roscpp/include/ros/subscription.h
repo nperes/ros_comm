@@ -119,12 +119,14 @@ public:
   uint32_t getNumCallbacks() const { return callbacks_.size(); }
   uint32_t getNumPublishers();
 
-  // We'll keep a list of these objects, representing in-progress XMLRPC 
+  // We'll keep a list of these objects, representing in-progress XMLRPC
   // connections to other nodes.
   class ROSCPP_DECL PendingConnection : public ASyncXMLRPCConnection
   {
     public:
-      PendingConnection(XmlRpc::XmlRpcClient* client, TransportUDPPtr udp_transport, const SubscriptionWPtr& parent, const std::string& remote_uri)
+		PendingConnection(XmlRpc::XmlRpcClient* client,
+		  TransportUDPPtr udp_transport, const SubscriptionWPtr& parent,
+		  const std::string& remote_uri)
       : client_(client)
       , udp_transport_(udp_transport)
       , parent_(parent)

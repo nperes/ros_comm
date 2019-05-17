@@ -71,9 +71,8 @@ int main(int argc, char** argv)
   g_array_size = atoi(argv[1]);
 
   ros::NodeHandle nh;
-
   ros::Publisher pub = nh.advertise<test_roscpp::TestArray>("roscpp/pubsub_test", 1);
   ros::Subscriber sub = nh.subscribe<test_roscpp::TestArray>("roscpp/subpub_test", 1, boost::bind(messageCallback, _1, pub));
-
   ros::spin();
+   	std::cerr << "[pub_sub.cpp] done\n";
 }

@@ -66,7 +66,8 @@ bool call(const std::string& service_name, MReq& req, MRes& res)
 {
   namespace st = service_traits;
   NodeHandle nh;
-  ServiceClientOptions ops(ros::names::resolve(service_name), st::md5sum(req), false, M_string());
+	ServiceClientOptions ops(ros::names::resolve(service_name), st::md5sum(req),
+	    false, M_string());
   ServiceClient client = nh.serviceClient(ops);
   return client.call(req, res);
 }

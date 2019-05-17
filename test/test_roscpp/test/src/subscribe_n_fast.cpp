@@ -129,8 +129,14 @@ TEST_F(Subscriptions, pubSubNFast)
     hints.reliable();
   else
     hints.unreliable();
-
+	
+	// TODO (nmf) remove debug
+//	std::cerr << "[subscribe_n_fast.cpp TEST pubSubNFast] calling nodehandle.subscribe\n";
+  
   ros::Subscriber sub = n.subscribe("roscpp/pubsub_test", msgs_expected, &Subscriptions::MsgCallback, (Subscriptions *)this, hints);
+  
+  // TODO (nmf) remove debug
+  //std::cerr << "[subscribe_n_fast.cpp TEST pubSubNFast] asserting sub\n";
   
   ASSERT_TRUE(sub);
 

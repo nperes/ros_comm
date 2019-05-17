@@ -115,6 +115,7 @@ bool ServiceClientLink::handleHeader(const Header& header)
   if (ss->getMD5Sum() != md5sum &&
       (md5sum != std::string("*") && ss->getMD5Sum() != std::string("*")))
   {
+
     std::string msg = std::string("client wants service ") + service +
             std::string(" to have md5sum ") + md5sum +
             std::string(", but it has ") + ss->getMD5Sum() +
@@ -152,7 +153,9 @@ bool ServiceClientLink::handleHeader(const Header& header)
     m["type"] = ss->getDataType();
     m["md5sum"] = ss->getMD5Sum();
     m["callerid"] = this_node::getName();
-    connection_->writeHeader(m, boost::bind(&ServiceClientLink::onHeaderWritten, this, _1));
+
+		connection_->writeHeader(m,
+		    boost::bind(&ServiceClientLink::onHeaderWritten, this, _1));
 
     ss->addServiceClientLink(shared_from_this());
   }

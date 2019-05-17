@@ -24,7 +24,16 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/ros/common.h.in ${CATKIN_DEVE
 
 find_package(Boost REQUIRED COMPONENTS chrono filesystem signals system)
 
-include_directories(include ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros ${catkin_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS})
+#This module supports two optional COMPONENTS: Crypto and SSL. If no components are requested it only requires the crypto library.
+#find_package(OpenSSL REQUIRED COMPONENTS ssl crypto)
+find_package(OpenSSL REQUIRED ssl crypto)
+if(OPENSSL_FOUND)
+	message("-- Found OpenSSL crypto library: ${OPENSSL_CRYPTO_LIBRARY}")
+else()
+	message("unable to locate OpenSSL")
+endif()
+
+include_directories(include ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros ${catkin_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
 
 add_message_files(
   DIRECTORY msg
@@ -122,6 +131,7 @@ add_library(roscpp
   src/libros/service.cpp
   src/libros/this_node.cpp
   src/libros/steady_timer.cpp
+	src/libros/security/security_module.cpp
   )
 
 add_dependencies(roscpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
@@ -129,6 +139,7 @@ add_dependencies(roscpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TA
 target_link_libraries(roscpp
   ${catkin_LIBRARIES}
   ${Boost_LIBRARIES}
+	${OPENSSL_LIBRARIES}
   )
 
 #explicitly install library and includes
