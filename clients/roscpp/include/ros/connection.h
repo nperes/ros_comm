@@ -64,7 +64,6 @@ typedef boost::function<
     bool)> ReadFinishedFunc;
 typedef boost::function<void(const ConnectionPtr&)> WriteFinishedFunc;
 typedef boost::function<bool(const ConnectionPtr&, const Header&)> HeaderReceivedFunc;
-typedef boost::function<void(const ConnectionPtr&)> ConnectionAvailableFunc;
 
 /**
  * \brief Encapsulates a connection to a remote host, independent of the
@@ -82,20 +81,16 @@ public:
     TransportDisconnect,
     HeaderError,
     Destructing,
+		SecureConnectionFailed
 	};
 
   Connection();
   ~Connection();
 
 	/**
-	 * \brief Initialize this connection, setting up internal state. Triggers a
-	 * read request to transport to read a connection header from transport if
-	 * header_func is defined and is_server is set.
-	 *
-	 * If header_func is defined, and tcpros is being used, this method will
-	 * secure the connection before allowing connection headers to be exchanged.
-	 * This involves exchanging security information with the other endpoint of
-	 * this connection.
+	 * \brief Initialize this connection, setting up internal state. Attempts to
+	 * read a connection header from transport if is_server and header_func is
+	 * defined.
 	 *
 	 * \note Guaranteed not to request any IO from transport until header_func is
 	 * defined, or one of setHeaderReceivedCallback or writeHeader methods are
@@ -105,7 +100,7 @@ public:
 	 * \param transport Actual transport layer implementation
 	 * \param is_server Indicates whether this connection should passively wait
 	 * 		for requests
-	 * \param header_func Callback to handle the connection header read.
+	 * \param header_func Callback to handle an incoming Connection Header.
 	 */
 	void initialize(const TransportPtr& transport, bool is_server,
 	    const HeaderReceivedFunc& header_func);
@@ -134,10 +129,10 @@ public:
   /**
    * \brief Send a list of string key/value pairs as a header message.
 	 *
-	 * \note Under tcpros, a call to this method will be delayed until the
-	 * connection completes security steps.
+	 * \note Under a reliable transport (currently TCPROS), action will be
+	 * delayed until both endpoints have change security-related information.
 	 *
-	 * \param key_vals The values to send. Neither keys nor values can have any
+	 * \param key_vals The values to send: neither keys nor values can have any
 	 *  	newlines in them
 	 * \param finished_callback The function to call when the header has finished
 	 * 		writing
@@ -189,12 +184,7 @@ public:
    * \brief Set the header receipt callback
 	 *
 	 * This method is expected to be called only once and the caller must ensure
-	 * that transport is properly initialized for IO. This method triggers an
-	 * (possibly deferred and non-blocking) attempt to read the connection header
-	 * from transport.
-	 *
-	 * \note Under tcpros, a call to this method will be delayed until the
-	 * connection completes security steps.
+	 * that transport is properly initialized for IO.
 	 *
 	 * \param func Callback that handles a received connection header.
    */
@@ -211,7 +201,10 @@ public:
 	 * \brief Set the Header associated with this connection (used with udpros,
 	 *  	which receives the connection header from XMLRPC negotiation).
    */
-  void setHeader(const Header& header) { header_ = header; }
+	void setHeader(const Header& header)
+	{
+		header_ = header;
+	}
 
   std::string getCallerId();
   std::string getRemoteString();
@@ -241,59 +234,43 @@ private:
 	void onHeaderRead(const ConnectionPtr& conn,
 	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
 	/**
-	 * \brief Writes the Diffie-Hellman public key elements to transport as part
-	 * 		of the DH key-exchange step.
+	 * \brief Connection security setup under TCPROS
+	 *
+	 * Currently includes a Diffie-Hellman exchange so that cryptography can
+	 * be used within this connection
 	 */
-	void writeDH(const boost::shared_array<uint8_t> dh_buffer,
-	    const uint32_t dh_size, const WriteFinishedFunc& finished_callback);
+	void doSecurityHandshake();
+	void writeSecurityHandshake(const boost::shared_array<uint8_t> &buffer, uint32_t size,
+	    const WriteFinishedFunc& finished_callback);
+	void onSecurityHandshakeWritten(const ConnectionPtr& conn);
+	void onSecurityHandshakeLengthRead(const ConnectionPtr& conn,
+	    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	void onSecurityHandshakeRead(const ConnectionPtr& conn,
+	    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	void onSecurityHandshakeDone(const ConnectionPtr& conn);
 	/**
-	 * \brief Handles the read of a (message/service) block lenght under a secure
-	 * connection.
+	 * \brief Internal callback: call when the length of an incoming data block
+	 * is read from transport under a security-enabled connection.
 	 */
 	void onSecureBlockLengthRead(const ConnectionPtr& conn,
-	  const boost::shared_array<uint8_t> buffer, uint32_t size, bool success);
+	    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
 	/**
-	 * \brief Handles the read of a (message/service) block data under a secure
+	 * \brief Internal callback: retrieves data received under a security-enabled
 	 * connection.
-	 *
-	 * Under a secure connection, additional steps must be taken to retrieve the
-	 * actual data.
 	 */
 	void onSecureBlockRead(const ConnectionPtr& conn,
-	    const boost::shared_array<uint8_t> buffer, uint32_t size, bool success);
-	/**
-	 * \brief Function to call when the security header is written - security
-	 * headers are exchanged even before connection headers (applicable only
-	 * under tcpros)
+	    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
+	/*
+	 * \brief Sets internal state according to Connection-Header exchange.
 	 */
-	void onSecureConnectionHeaderWritten(const ConnectionPtr& conn);
-	/**
-	 * \brief Function to call when the actual security header is read - security
-	 * headers are exchanged even before connection headers (applicable only
-	 * under tcpros)
-	 */
-	void onSecureConnectionHeaderLengthRead(const ConnectionPtr& conn,
-	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
-	/**
-	 * \brief call back when security header length is read - security
-	 * headers are exchanged even before connection headers (applicable only
-	 * under tcpros)
-	 */
-	void onSecureConnectionHeaderRead(const ConnectionPtr& conn,
-	  const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success);
-	/**
-	 * \brief call back when security headers exchange (applicable only under
-	 * tcpros) completes.
-	 *
-	 * Delayed read and/or write of connection headers are triggered.
-	 */
-	void onConnectionSecured(const ConnectionPtr& conn);
+	void onConnectionHeaderExchangeDone();
 	/**
 	 * \brief Read size bytes from transport.
 	 */
 	void readSimple(uint32_t size, const ReadFinishedFunc& callback);
 	/**
-	 * \brief Read at least, size bytes from transport, under a secure connection.
+	 * \brief Read at least size bytes from transport, under a
+	 * security-enabled connection.
 	 */
 	void readSecure(uint32_t size, const ReadFinishedFunc& callback);
 	/**
@@ -310,10 +287,6 @@ private:
 	 */
 	void writeSecure(const boost::shared_array<uint8_t>& buffer, uint32_t size,
 	    const WriteFinishedFunc& finished_callback, bool immediate);
-	/**
-	 * \brief Initializes the exchange of security headers
-	 */
-	void secureConnection();
   /**
    * \brief Read data off our transport.  Also manages calling the read callback.  If there is any data to be read,
    * read() will read it until the fixed read buffer is filled.
@@ -333,18 +306,16 @@ private:
   /// Transport associated with us
   TransportPtr transport_;
 	/// Handles the incoming header
-  HeaderReceivedFunc header_func_;
-
-	/// Lock me when checking connection secure status before exchanging
-	/// connection headers and during connection secure status update
-	boost::recursive_mutex available_mutex_;
+  HeaderReceivedFunc header_received_callback_;
 	/// Indicates whether this connection is ready to call read/write methods
-	bool is_available;
+	bool connection_ready_;
+	boost::recursive_mutex connection_ready_mutex_;
+	std::atomic_flag secure_connection_requested_;
   /// Read buffer that ends up being passed to the read callback
   boost::shared_array<uint8_t> read_buffer_;
   /// Amount of data currently in the read buffer, in bytes
   uint32_t read_filled_;
-  /// Size of the read buffer, in bytes
+	/// Capacity of the read buffer, in bytes
   uint32_t read_size_;
   /// Function to call when the read is finished
   ReadFinishedFunc read_callback_;
@@ -359,8 +330,7 @@ private:
 	// // appropriate read method to call under this connection (simple/secure)
 	boost::function<void(uint32_t, const ReadFinishedFunc&)> read_func_;
 
-	// TODO(nmf) handle this differently? (ReadBuffer)
-	boost::shared_array<uint8_t> buffered_read_buffer_;
+	boost::shared_array<uint8_t> buffered_read_;
 	uint32_t buffered_read_size_;
 	uint32_t buffered_read_capacity_;
 	uint32_t buffered_read_offset_;
@@ -400,7 +370,6 @@ private:
 	/// If we're sending a header error we disable most other calls
   bool sending_header_error_;
 
-	//// TODO(nmf) doc
 	SecurityModulePtr security_module_;
 
 	// TODO(nmf) handle this differently

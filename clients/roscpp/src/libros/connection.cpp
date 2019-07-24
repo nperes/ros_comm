@@ -41,15 +41,14 @@
 #include <boost/bind.hpp>
 #include <boost/make_shared.hpp>
 
-#include <openssl/hmac.h>
-
 namespace ros
 {
 
 Connection::Connection() :
 		    is_server_(false),
 		    dropped_(false),
-		    is_available(false),
+		    connection_ready_(false),
+		    secure_connection_requested_(ATOMIC_FLAG_INIT),
 		    read_filled_(0),
 		    read_size_(0),
 		    reading_(false),
@@ -63,7 +62,8 @@ Connection::Connection() :
 		    writing_(false),
 		    has_write_callback_(0),
 		    sending_header_error_(false),
-		    read_header_func_(0) {
+		    read_header_func_(0)
+{
 }
 
 Connection::~Connection() {
@@ -73,7 +73,10 @@ Connection::~Connection() {
 }
 
 void Connection::initialize(const TransportPtr& transport, bool is_server,
-    const HeaderReceivedFunc& header_func) {
+    const HeaderReceivedFunc& header_func)
+{
+	ROS_ASSERT(transport);
+	ROS_ASSERT(!transport_);
 
 	transport_ = transport;
 	is_server_ = is_server;
@@ -86,43 +89,52 @@ void Connection::initialize(const TransportPtr& transport, bool is_server,
 	read_func_ = boost::bind(&Connection::readSimple, this, _1, _2);
 	write_func_ = boost::bind(&Connection::writeSimple, this, _1, _2, _3, _4);
 
-	if (!transport->requiresHeader()) {
-		is_available = true;
+	if (!transport->requiresHeader())
+	{
+		connection_ready_ = true;
 		return;
 	}
 
-	ROS_ASSERT(!security_module_);
-	security_module_ = boost::make_shared<SecurityModule>();
+	security_module_ = boost::make_shared<SecurityModule>(is_server_);
 
 	if (header_func)
-		setHeaderReceivedCallback(header_func);
-}
-
-void Connection::secureConnection() {
-
-	ROS_ASSERT(transport_->requiresHeader()); // no sense in this call otherwise
-
 	{
-		boost::recursive_mutex::scoped_lock lock(available_mutex_);
-
-		if (is_server_) { // server-side takes the passive role
-			read(4,
-			    boost::bind(&Connection::onSecureConnectionHeaderLengthRead, this, _1, _2, _3,
-			        _4));
-		} else { // client-side takes the active role
-			boost::shared_array<uint8_t> dh_public_key;
-			size_t dh_public_key_size;
-
-			//TODO(nmf) assert/handle proper return
-			security_module_->initialize(dh_public_key, dh_public_key_size,
-			    peer_key_retrieved_callback_);
-
-			writeDH(dh_public_key, dh_public_key_size,
-			    boost::bind(&Connection::onSecureConnectionHeaderWritten, this, _1));
-		}
-	} //unlock(available_mutex)
+		setHeaderReceivedCallback(header_func);
+	}
 }
 
+// called once, either from setHeaderReceivedCallback() or from
+// writeHeader(); no need to lock yet
+void Connection::doSecurityHandshake() {
+	ROS_ASSERT(transport_->requiresHeader());
+	// caller has initialized the connection-header exchange => transport is
+	// ready (no guarantees otherwise!)
+	ROS_ASSERT(header_received_callback_ || header_written_callback_);
+
+	if (is_server_)
+	{
+		read(4,
+		    boost::bind(&Connection::onSecurityHandshakeLengthRead, this, _1, _2,
+		        _3, _4));
+	} else
+	{
+		boost::shared_array<uint8_t> dh_peer_key;
+		size_t dh_peer_key_size;
+
+		if (!security_module_->initialize(dh_peer_key, dh_peer_key_size,
+		    peer_key_retrieved_callback_))
+		{
+			drop(SecureConnectionFailed);
+			return;
+		}
+
+		read(4,
+		    boost::bind(&Connection::onSecurityHandshakeLengthRead, this, _1, _2,
+		        _3, _4));
+		writeSecurityHandshake(dh_peer_key, dh_peer_key_size,
+		    boost::bind(&Connection::onSecurityHandshakeWritten, this, _1));
+	}
+}
 
 boost::signals2::connection Connection::addDropListener(const DropFunc& slot)
 {
@@ -301,7 +313,7 @@ void Connection::read(uint32_t size, const ReadFinishedFunc& callback)
   {
     return;
   }
-	// added indirection level to handle secure vs insecure connections
+	// indirection to handle sec-enabled vs sec-disabled connections
 	read_func_(size, callback);
 }
 
@@ -312,10 +324,10 @@ void Connection::readSimple(uint32_t size, const ReadFinishedFunc& callback) {
 		ROS_ASSERT(!read_callback_);
 
 		read_callback_ = callback;
+		has_read_callback_ = 1;
 		read_buffer_ = boost::shared_array<uint8_t>(new uint8_t[size]);
 		read_size_ = size;
 		read_filled_ = 0;
-		has_read_callback_ = 1;
 	}
 
 	transport_->enableRead();
@@ -324,13 +336,12 @@ void Connection::readSimple(uint32_t size, const ReadFinishedFunc& callback) {
 
 void Connection::readSecure(uint32_t size, const ReadFinishedFunc& callback) {
 
-		boost::shared_array<uint8_t> read_return = nullptr;
+	boost::shared_array<uint8_t> read_return = nullptr;
 
 	{
 		boost::recursive_mutex::scoped_lock lock(read_mutex_);
 
 		ROS_ASSERT(!read_callback_);
-		ROS_ASSERT(size > 0);
 
 		if (size <= buffered_read_size_) // can return from buffer
 		{
@@ -339,12 +350,13 @@ void Connection::readSecure(uint32_t size, const ReadFinishedFunc& callback) {
 			    size, buffered_read_size_);
 
 			read_return = boost::shared_array<uint8_t>(new uint8_t[size]);
+
 			memcpy(read_return.get(),
-			    buffered_read_buffer_.get() + buffered_read_offset_,
+			    buffered_read_.get() + buffered_read_offset_,
 			    size);
+
 			buffered_read_size_ -= size;
 			buffered_read_offset_ += size;
-
 		} else // need to read from transport
 		{
 			ROS_DEBUG_NAMED("superdebug",
@@ -352,12 +364,14 @@ void Connection::readSecure(uint32_t size, const ReadFinishedFunc& callback) {
 					    "current buffer contains only [%d] bytes", size,
 			    buffered_read_size_);
 
-			boost::shared_array<uint8_t> tmp = buffered_read_buffer_;
-			buffered_read_buffer_ = boost::shared_array<uint8_t>(new uint8_t[size]);
+			boost::shared_array<uint8_t> tmp = buffered_read_;
+			buffered_read_ = boost::shared_array<uint8_t>(new uint8_t[size]);
 
 			if (buffered_read_size_ > 0)
-				memcpy(buffered_read_buffer_.get(), tmp.get() + buffered_read_offset_,
+			{
+				memcpy(buffered_read_.get(), tmp.get() + buffered_read_offset_,
 				    buffered_read_size_);
+			}
 
 			buffered_read_offset_ = 0;
 			// buffered_read_size_ remains unchanged until data is returned
@@ -381,12 +395,12 @@ void Connection::readSecure(uint32_t size, const ReadFinishedFunc& callback) {
 	    boost::bind(&Connection::onSecureBlockLengthRead, this, _1, _2, _3, _4));
 }
 
-// internal call from transport - read_mutex_ still locked
 void Connection::onSecureBlockLengthRead(const ConnectionPtr& conn,
-    const boost::shared_array<uint8_t> buffer, uint32_t size, bool success) {
-
+    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success)
+{
 	ROS_ASSERT(conn.get() == this);
 	ROS_ASSERT(size == 4);
+	(void) size;
 
 	if (!success)
 		return;
@@ -397,43 +411,40 @@ void Connection::onSecureBlockLengthRead(const ConnectionPtr& conn,
 	    boost::bind(&Connection::onSecureBlockRead, this, _1, _2, _3, _4));
 }
 
-// internal call from transport - read_mutex_ still locked
 void Connection::onSecureBlockRead(const ConnectionPtr& conn,
-    const boost::shared_array<uint8_t> buffer, uint32_t size, bool success) {
-
+    const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success)
+{
 	ROS_ASSERT(conn.get() == this);
 
 	if (!success)
 		return;
 
 	ROS_DEBUG_NAMED("superdebug",
-	    "Retrieving secured data from a block of [%u] bytes", size);
+	    "Retrieving secured data from a [%u]-bytes block", size);
 
-	boost::shared_array<uint8_t> plain_data = nullptr;
-	uint32_t plain_data_len = 0;
+	boost::shared_array<uint8_t> retrieved = nullptr;
+	uint32_t retrieved_size = 0;
 
-
-	if (!security_module_->retrieve(buffer, size, 0, plain_data,
-	    plain_data_len, 0))
+	if (!security_module_->retrieve(buffer.get(), size, retrieved,
+	    retrieved_size, 0))
 	{
-		//TODO(nmf) handle fail
-		// DROP;
+		//TODO(nmf) proper error handling
+		retrieved = boost::shared_array<uint8_t>(new uint8_t[0]);
+		retrieved_size = 0;
 	}
 
-	uint32_t available_bytes_total = plain_data_len + buffered_read_size_;
+	uint32_t available_bytes_total = retrieved_size + buffered_read_size_;
 
 	ROS_DEBUG_NAMED("superdebug",
 	    "Retrieved [%u] of data from secure block of [%u] bytes: progress "
-			    "[%u]/[%u]", plain_data_len, size, available_bytes_total,
+			    "[%u]/[%u]", retrieved_size, size, available_bytes_total,
 	    read_pending_size_);
-
 
 	if (read_pending_size_ > available_bytes_total)
 	{
-		// store and read more
-		memcpy(buffered_read_buffer_.get() + buffered_read_size_, plain_data.get(),
-		    plain_data_len);
-		buffered_read_size_ += plain_data_len;
+		memcpy(buffered_read_.get() + buffered_read_size_, retrieved.get(),
+		    retrieved_size);
+		buffered_read_size_ += retrieved_size;
 
 		readSimple(4,
 		    boost::bind(&Connection::onSecureBlockLengthRead, this, _1, _2, _3,
@@ -441,15 +452,15 @@ void Connection::onSecureBlockRead(const ConnectionPtr& conn,
 	} else
 	{
 		uint32_t required_bytes = read_pending_size_ - buffered_read_size_;
-		memcpy(buffered_read_buffer_.get() + buffered_read_size_, plain_data.get(),
+		memcpy(buffered_read_.get() + buffered_read_size_, retrieved.get(),
 		    required_bytes);
-		boost::shared_array<uint8_t> pending_read = boost::shared_array<uint8_t>(
-		    new uint8_t[0]);
-		pending_read.swap(buffered_read_buffer_);
-		buffered_read_buffer_.swap(plain_data);
-		buffered_read_size_ = plain_data_len - required_bytes;
-		buffered_read_offset_ += required_bytes;
 
+		//TODO(nmf) rethink this
+		buffered_read_.swap(retrieved);
+		boost::shared_array<uint8_t> pending_read = retrieved;
+
+		buffered_read_size_ = retrieved_size - required_bytes;
+		buffered_read_offset_ += required_bytes;
 
 		ReadFinishedFunc callback = read_pending_callback_;
 		int pending_read_size = read_pending_size_;
@@ -467,20 +478,35 @@ void Connection::onSecureBlockRead(const ConnectionPtr& conn,
 void Connection::write(const boost::shared_array<uint8_t>& buffer,
   uint32_t size, const WriteFinishedFunc& callback, bool immediate)
 {
-	// caller must ensure size > 0
+	ROS_ASSERT(buffer);
+	ROS_ASSERT(size > 0);
+	ROS_ASSERT(callback);
 
   if (dropped_ || sending_header_error_)
 	{
     return;
 	}
 
+	// added indirection level to handle secure vs insecure connections
+	write_func_(buffer, size, callback, immediate);
+
+	if (write_size_ == 0)
 	{
-		boost::mutex::scoped_lock lock(write_callback_mutex_);
+		ROS_WARN("Dropping write request due to fail in securing message");
 
-		ROS_ASSERT(!write_callback_);
+		{
+			boost::mutex::scoped_lock lock(write_callback_mutex_);
+			ROS_ASSERT(has_write_callback_);
+			write_callback_ = WriteFinishedFunc();
+			write_buffer_ = boost::shared_array<uint8_t>();
+			write_sent_ = 0;
+			write_size_ = 0;
+			has_write_callback_ = 0;
+		}
 
-		// added indirection level to handle secure vs insecure connections
-		write_func_(buffer, size, callback, immediate);
+		callback(shared_from_this());
+
+		return;
 	}
 
   transport_->enableWrite();
@@ -491,46 +517,58 @@ void Connection::write(const boost::shared_array<uint8_t>& buffer,
 	}
 }
 
-// note: caller already holds write_callback_mutex
 void Connection::writeSimple(const boost::shared_array<uint8_t>& buffer,
   uint32_t size, const WriteFinishedFunc& callback, bool immediate) {
 
 	(void) immediate;
 
-	write_callback_ = callback;
-	write_buffer_ = buffer;
-	write_size_ = size;
-	write_sent_ = 0;
-	has_write_callback_ = 1;
+	{
+		boost::mutex::scoped_lock lock(write_callback_mutex_);
+
+		ROS_ASSERT(!write_callback_);
+
+		write_callback_ = callback;
+		has_write_callback_ = 1;
+		write_sent_ = 0;
+		write_buffer_ = buffer;
+		write_size_ = size;
+	}
 }
 
-// note: caller already holds write_callback_mutex
+// requires: write_callback_ set
 void Connection::writeSecure(const boost::shared_array<uint8_t>& buffer,
     uint32_t size, const WriteFinishedFunc& callback, bool immediate) {
 
 	(void) immediate;
 
-	// build secure message
 	boost::shared_array<uint8_t> secure_data = nullptr;
 	uint32_t secure_data_len = 0;
 
-	if (!security_module_->secure(buffer, size, 0, secure_data, secure_data_len,
+	if (security_module_->secure(buffer.get(), size, secure_data, secure_data_len,
 	    4))
 	{
-		//TODO(nmf) handle fail
+		ROS_DEBUG_NAMED("superdebug",
+				"Secured [%u] bytes worth of data, setting the write size to a total "
+						"of [%u] bytes", size, write_size_);
+
+		*((uint32_t*) secure_data.get()) = secure_data_len;
+
+		{
+			boost::mutex::scoped_lock lock(write_callback_mutex_);
+
+			ROS_ASSERT(!write_callback_);
+
+			write_callback_ = callback;
+			has_write_callback_ = 1;
+			write_sent_ = 0;
+			write_buffer_ = secure_data;
+			write_size_ = 4 + secure_data_len;
+		}
+
+		return;
 	}
 
-	*((uint32_t*) secure_data.get()) = secure_data_len;
-
-	write_callback_ = callback;
-	write_buffer_ = secure_data;
-	write_size_ = 4 + secure_data_len;
-	write_sent_ = 0;
-	has_write_callback_ = 1;
-
-	ROS_DEBUG_NAMED("superdebug",
-	    "Secured [%u] bytes worth of data, setting the write size to a total "
-			    "of [%u] bytes", size, write_size_);
+	write_size_ = 0;
 }
 
 
@@ -539,7 +577,7 @@ void Connection::onDisconnect(const TransportPtr& transport)
   (void)transport;
   ROS_ASSERT(transport == transport_);
 
-  drop(TransportDisconnect);
+	drop(TransportDisconnect);
 }
 
 void Connection::drop(DropReason reason)
@@ -568,16 +606,26 @@ bool Connection::isDropped()
   return dropped_;
 }
 
-
+// beware: TransportSubscriberLink::handleHeader() calls us even under UDP; if
+// !transport->requiresHeader() we are still expected to trigger the callback
 void Connection::writeHeader(const M_string& key_vals,
-    const WriteFinishedFunc& finished_callback) {
+  const WriteFinishedFunc& finished_callback)
+{
+	ROS_ASSERT(finished_callback);
 
-	ROS_ASSERT(!header_written_callback_);
+	bool has_previous_secure_connection_call =
+	    secure_connection_requested_.test_and_set();
+	bool connection_ready;
 
-	// links do not know connection types, and they sometimes call writeHeader
-	// during initialization; we just drop it for udpros
-	if (!transport_->requiresHeader()) {
-		header_written_callback_ = finished_callback;
+	if (!transport_->requiresHeader())
+	{
+		{
+			boost::recursive_mutex::scoped_lock lock(connection_ready_mutex_);
+
+			ROS_ASSERT(!header_written_callback_);
+			header_written_callback_ = finished_callback;
+		}
+
 		onHeaderWritten(shared_from_this());
 		return;
 	}
@@ -592,42 +640,39 @@ void Connection::writeHeader(const M_string& key_vals,
 	*((uint32_t*) full_msg.get()) = len;
 
 	{
-		boost::recursive_mutex::scoped_lock lock(available_mutex_);
+		boost::recursive_mutex::scoped_lock lock(connection_ready_mutex_);
 
+		ROS_ASSERT(!header_written_callback_);
 		header_written_callback_ = finished_callback;
+
 		write_header_func_ = boost::bind(&Connection::write, this, full_msg,
 		    msg_len,
 		    WriteFinishedFunc(boost::bind(&Connection::onHeaderWritten, this, _1)),
 		    false);
-
-		//TODO(nmf) consider is_securing flag
-		if (!is_available && !header_func_) {
-
-			secureConnection();
-
-			ROS_DEBUG_NAMED("superdebug",
-			    "Delaying [%u] bytes worth write header request until connection is "
-					    "ready", len);
-			return;
-		}
-
-		if (!is_available)
-			return;
+		connection_ready = connection_ready_;
 	}
 
-	write(full_msg, msg_len, boost::bind(&Connection::onHeaderWritten, this, _1),
-	    false);
+	if (!has_previous_secure_connection_call)
+	{
+		ROS_DEBUG_NAMED("superdebug",
+		    "Delaying [%u] bytes worth write header request until connection is "
+				    "ready", len);
+		doSecurityHandshake();
+	} else if (connection_ready)
+	{
+		write_header_func_();
+	}
 }
 
-void Connection::writeDH(const boost::shared_array<uint8_t> dh_buffer,
-    const uint32_t dh_size, const WriteFinishedFunc& finished_callback)
+void Connection::writeSecurityHandshake(
+    const boost::shared_array<uint8_t>& buffer, uint32_t size,
+    const WriteFinishedFunc& finished_callback)
 {
-
-	uint32_t dh_exchange_size = 4 + dh_size;
+	uint32_t dh_exchange_size = 4 + size;
 	boost::shared_array<uint8_t> dh_exchange = boost::shared_array<uint8_t>(
 	    new uint8_t[dh_exchange_size]);
-	memcpy(dh_exchange.get() + 4, dh_buffer.get(), dh_size);
-	*((uint32_t*) dh_exchange.get()) = dh_size;
+	memcpy(dh_exchange.get() + 4, buffer.get(), size);
+	*((uint32_t*) dh_exchange.get()) = size;
 
 	write(dh_exchange, dh_exchange_size, finished_callback, false);
 }
@@ -666,10 +711,10 @@ void Connection::onHeaderLengthRead(const ConnectionPtr& conn,
   read(len, boost::bind(&Connection::onHeaderRead, this, _1, _2, _3, _4));
 }
 
-// callback from transport
 void Connection::onHeaderRead(const ConnectionPtr& conn,
   const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success)
 {
+
   ROS_ASSERT(conn.get() == this);
 
   if (!success)
@@ -679,63 +724,79 @@ void Connection::onHeaderRead(const ConnectionPtr& conn,
   if (!header_.parse(buffer, size, error_msg))
   {
     drop(HeaderError);
-  }
-  else
-  {
-    std::string error_val;
-		if (header_.getValue("error", error_val))
-    {
-			ROSCPP_LOG_DEBUG(
-			    "Received error message in header  for connection to [%s]: [%s]",
-			    transport_->getTransportInfo().c_str(), error_val.c_str());
-      drop(HeaderError);
-    }
-		// TODO(nmf)redo and comment this bit - consequence of broken encapsulation
-		// of transport in service.cpp (called outside a connection)
-		std::string probe_val;
-		if (!is_available && !header_.getValue("probe", probe_val))
-		{
-			ROSCPP_LOG_DEBUG(
-			    "Received actual connection header before security exchange for connection [%s]: only probe header allowed",
-			    transport_->getTransportInfo().c_str());
-			drop(HeaderError);
-		}
-
-    else
-    {
-      ROS_ASSERT(header_func_);
-      transport_->parseHeader(header_);
-      header_func_(conn, header_);
-    }
+		return;
   }
 
+	std::string error_val;
+	if (header_.getValue("error", error_val))
+	{
+		ROSCPP_LOG_DEBUG(
+		    "Received error message in header  for connection to [%s]: [%s]",
+		    transport_->getTransportInfo().c_str(), error_val.c_str());
+		drop(HeaderError);
+		return;
+	}
+
+	std::string hmacs, encryption;
+	if (header_.getValue("hmacs", hmacs) && hmacs != "0" && hmacs != "1")
+	{
+		ROSCPP_LOG_DEBUG("Header element \"hmacs\" had invalid value");
+		drop(HeaderError);
+		return;
+	}
+	else if (header_.getValue("encryption", encryption) && encryption != "0"
+	    && encryption != "1")
+	{
+		ROSCPP_LOG_DEBUG("Header element \"encryption\" had invalid value");
+		drop(HeaderError);
+		return;
+	}
+
+
+	// consequence of broken encapsulation of transport in service.cpp
+	// (called outside a connection)
+	std::string probe_val;
+	if (!connection_ready_ && !header_.getValue("probe", probe_val))
+	{
+		ROSCPP_LOG_DEBUG(
+		    "Received actual connection header before security exchange for connection [%s]: only probe header allowed",
+		    transport_->getTransportInfo().c_str());
+		drop(HeaderError);
+		return;
+	}
+
+	ROS_ASSERT(header_received_callback_);
+	transport_->parseHeader(header_);
+
+	if (!is_server_)
+	{
+		onConnectionHeaderExchangeDone();
+	}
+
+	header_received_callback_(conn, header_);
 }
 
-void Connection::onSecureConnectionHeaderWritten(const ConnectionPtr& conn)
+void Connection::onSecurityHandshakeWritten(const ConnectionPtr& conn)
 {
 	(void) conn;
 	ROS_ASSERT(conn.get() == this);
-
-	read(4,
-	  boost::bind(&Connection::onSecureConnectionHeaderLengthRead, this, _1, _2, _3, _4));
 }
 
-void Connection::onSecureConnectionHeaderLengthRead(const ConnectionPtr& conn,
+void Connection::onSecurityHandshakeLengthRead(const ConnectionPtr& conn,
     const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success)
 {
-
-	(void) size;
 	ROS_ASSERT(conn.get() == this);
 	ROS_ASSERT(size == 4);
+	(void) size;
 
 	if (!success)
 		return;
 
 	uint32_t len = *((uint32_t*) buffer.get());
 
-	//TODO(nmf) adjust this error handling
+	//TODO(nmf) proper error handling
 	if (len > 1000000000) {
-		ROS_ERROR("a header of over a gigabyte was "
+		ROS_ERROR("a secure connection header of over a gigabyte was "
 			"predicted in tcpros. that seems highly "
 			"unlikely, so I'll assume protocol "
 			"synchronization is lost.");
@@ -746,61 +807,66 @@ void Connection::onSecureConnectionHeaderLengthRead(const ConnectionPtr& conn,
 	    "Calling to read secure connection header of [%u] bytes worth length",
 	    size);
 
-	read(len, boost::bind(&Connection::onSecureConnectionHeaderRead, this, _1, _2, _3, _4));
+	read(len, boost::bind(&Connection::onSecurityHandshakeRead, this, _1, _2, _3, _4));
 }
 
-// TODO(nmf) rename?
-void Connection::onSecureConnectionHeaderRead(const ConnectionPtr& conn,
+void Connection::onSecurityHandshakeRead(const ConnectionPtr& conn,
     const boost::shared_array<uint8_t>& buffer, uint32_t size, bool success)
 {
-
 	ROS_ASSERT(conn.get() == this);
 	if (!success)
-		return;
-
-	if (peer_key_retrieved_callback_) // client side
 	{
-		//TODO (nmf) attest success of peer_key_retrieved
-		//TODO (nmf) remove success -> already asserted it at the top
-		peer_key_retrieved_callback_(buffer, size, success);
-		onConnectionSecured(conn);
+		return;
+	}
+
+	if (!security_module_->dhParseKey(buffer.get(), size))
+	{
+		drop(SecureConnectionFailed);
+		return;
+	}
+
+	if (peer_key_retrieved_callback_)
+	{
+		peer_key_retrieved_callback_(buffer, size);
+		onSecurityHandshakeDone(conn);
 		return;
 	}
 
 	boost::shared_array<uint8_t> dh_public_key = nullptr;
 	size_t dh_public_key_size = 0;
 
-	// TODO (nmf) test not dh_public_key not null
 	if (security_module_->initialize(dh_public_key, dh_public_key_size, buffer,
 	    size))
 	{
-		writeDH(dh_public_key, dh_public_key_size,
-		    boost::bind(&Connection::onConnectionSecured, this, _1));
+		writeSecurityHandshake(dh_public_key, dh_public_key_size,
+		    boost::bind(&Connection::onSecurityHandshakeDone, this, _1));
 		return;
 	}
 
-	//TODO(nmf) ros_debug and comment - encapsulation breach in service
-	// !key? ->  - probeHeader ? OK : DROP
-	std::string error_msg;
-	if (header_.parse(buffer, size, error_msg))
-	{
-		is_available = true;
-		onHeaderRead(conn, buffer, size, success);
-	}
+	//TODO(nmf) do proper error handling
+	drop(SecureConnectionFailed);
 }
 
-void Connection::onConnectionSecured(const ConnectionPtr& conn)
+void Connection::onSecurityHandshakeDone(const ConnectionPtr& conn)
 {
 	ROS_ASSERT(conn.get() == this);
+
+	(void) conn;
 
 	boost::function<void()> read_header_func = 0;
 	boost::function<void()> write_header_func = 0;
 
 	{
-		boost::recursive_mutex::scoped_lock lock(available_mutex_);
-		is_available = true;
+		boost::recursive_mutex::scoped_lock lock(connection_ready_mutex_);
+
+		ROS_ASSERT(!connection_ready_);
+
+		security_module_->setHmacs(true).setEncryption(true);
 		read_func_ = boost::bind(&Connection::readSecure, this, _1, _2);
 		write_func_ = boost::bind(&Connection::writeSecure, this, _1, _2, _3, _4);
+
+		connection_ready_ = true;
+
 		read_header_func = read_header_func_;
 		write_header_func = write_header_func_;
 	}
@@ -815,15 +881,45 @@ void Connection::onConnectionSecured(const ConnectionPtr& conn)
 	}
 }
 
+void Connection::onConnectionHeaderExchangeDone()
+{
+	ROS_ASSERT(transport_->requiresHeader());
+
+	std::string hmacs, encryption;
+	header_.getValue("hmacs", hmacs);
+	header_.getValue("encryption", encryption);
+
+	fprintf(stderr, "[%s]\n", hmacs.c_str());
+	fprintf(stderr, "[%s]\n", encryption.c_str());
+
+	if (hmacs == "0" && encryption == "0")
+	{
+		fprintf(stderr, "no security\n");
+		read_func_ = boost::bind(&Connection::readSimple, this, _1, _2);
+		write_func_ = boost::bind(&Connection::writeSimple, this, _1, _2, _3, _4);
+	} else
+	{
+		fprintf(stderr, "using security\n");
+		read_func_ = boost::bind(&Connection::readSecure, this, _1, _2);
+		write_func_ = boost::bind(&Connection::writeSecure, this, _1, _2, _3, _4);
+
+		security_module_->setHmacs(hmacs == "1").setEncryption(encryption == "1");
+	}
+}
+
+// note: might get called even when no header has actually been written - see
+// writeHeader(); regardless, always trigger the callback
 void Connection::onHeaderWritten(const ConnectionPtr& conn)
 {
-  ROS_ASSERT(conn.get() == this);
+	ROS_ASSERT(conn.get() == this);
 	ROS_ASSERT(header_written_callback_);
 
-	// TODO(nmf) change this
-	//transport_->requiresHeader();
+	if (transport_->requiresHeader() && is_server_)
+	{
+		onConnectionHeaderExchangeDone();
+	}
+
 	header_written_callback_(conn);
-  header_written_callback_ = WriteFinishedFunc();
 }
 
 void Connection::onErrorHeaderWritten(const ConnectionPtr& conn)
@@ -833,34 +929,47 @@ void Connection::onErrorHeaderWritten(const ConnectionPtr& conn)
 }
 
 
+// important to keep original code semantics:
+// sets header_func_ and returns if !transport->requiresHeader();
 void Connection::setHeaderReceivedCallback(const HeaderReceivedFunc& func)
 {
-	if (!transport_->requiresHeader())
-		return;
+	ROS_ASSERT(func);
+	ROS_ASSERT(!header_received_callback_);
 
-	ROS_ASSERT(!header_func_);
+	bool has_previous_secure_connection_call =
+	    secure_connection_requested_.test_and_set();
+	bool connection_ready;
 
 	{
-		boost::recursive_mutex::scoped_lock lock(available_mutex_);
+		boost::recursive_mutex::scoped_lock lock(connection_ready_mutex_);
 
-		header_func_ = func;
-		//TODO(nmf) rename with *_callback? - this is actually just a pending call
+		header_received_callback_ = func;
 		read_header_func_ = boost::bind(&Connection::read, this, 4,
 		    ReadFinishedFunc(
 		        boost::bind(&Connection::onHeaderLengthRead, this, _1, _2, _3,
 		            _4)));
-
-		if (!is_available && !write_header_func_) {
-			secureConnection();
-			return;
-		}
-
-		if (!is_available)
-			return;
+		connection_ready = connection_ready_;
 	}
 
-	read(4, boost::bind(&Connection::onHeaderLengthRead, this, _1, _2, _3, _4));
+	if (!transport_->requiresHeader())
+	{
+		return;
+	}
+
+	if (!has_previous_secure_connection_call)
+	{
+		ROS_DEBUG_NAMED("superdebug",
+		    "Delaying read header request until connection is ready");
+		doSecurityHandshake();
+		return;
+	}
+
+	if (connection_ready)
+	{
+		read_header_func_();
+	}
 }
+
 
 std::string Connection::getCallerId()
 {
@@ -880,6 +989,5 @@ std::string Connection::getRemoteString()
 	  << transport_->getTransportInfo() << "]";
   return ss.str();
 }
-
 
 }

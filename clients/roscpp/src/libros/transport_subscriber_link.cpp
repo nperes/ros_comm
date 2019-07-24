@@ -112,6 +112,15 @@ bool TransportSubscriberLink::handleHeader(const Header& header)
   m["callerid"] = this_node::getName();
   m["latching"] = pt->isLatching() ? "1" : "0";
   m["topic"] = topic_;
+
+	std::string hmacs, encryption;
+	if (header.getValue("hmacs", hmacs)
+	    && header.getValue("encryption", encryption))
+	{
+		m["hmacs"] = hmacs;
+		m["encryption"] = encryption;
+	}
+
 	connection_->writeHeader(m,
 	    boost::bind(&TransportSubscriberLink::onHeaderWritten, this, _1));
 

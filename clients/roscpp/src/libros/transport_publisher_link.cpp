@@ -98,6 +98,9 @@ bool TransportPublisherLink::initialize(const ConnectionPtr& connection)
     header["type"] = parent->datatype();
     header["tcp_nodelay"] = transport_hints_.getTCPNoDelay() ? "1" : "0";
 
+		header["hmacs"] = transport_hints_.getHmacs() ? "1" : "0";
+		header["encryption"] = transport_hints_.getEncrypt() ? "1" : "0";
+
 		connection_->writeHeader(header,
 		    boost::bind(&TransportPublisherLink::onHeaderWritten, this, _1));
   }

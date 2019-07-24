@@ -17,9 +17,9 @@
 
 #include <boost/bind.hpp>
 
+//TODO(nmf) temporary
 static int errorHandler(const char *str, size_t len, void *u)
 {
-	//TODO (nmf) work this out
 	(void) len;
 	(void) u;
 	ROS_ERROR("%s", str);
@@ -28,59 +28,61 @@ static int errorHandler(const char *str, size_t len, void *u)
 
 namespace ros {
 
-SecurityModule::SecurityModule() :
-		    is_initialized(0),
+// TODO(nmf) add proper error handling throughout
+SecurityModule::SecurityModule(int flags) :
 		    dh_keys_(nullptr),
 		    dh_secret_(nullptr),
-		    dh_secret_size_(0),
-		    hmac_key_(nullptr),
-		    hmac_key_size_(0),
-		    encryption_key_(nullptr),
-		    encryption_key_size_(0),
-		    dh_public_peer_key_(nullptr)
+		    dh_secret_len_(0),
+		    md_key_(nullptr),
+		    md_pkey_(nullptr),
+		    md_key_size_(0),
+		    cipher_key_(nullptr),
+		    dh_public_peer_key_(nullptr),
+		    evp_cipher_(nullptr),
+		    cipher_ctx_(nullptr),
+		    md_algorithm_(nullptr),
+		    md_ctx_(nullptr),
+		    md_len_(0)
 {
+	flags_ = flags;
 	if (1 == RAND_status())
 		RAND_poll();
 }
 
 SecurityModule::~SecurityModule()
 {
-	//TODO(nmf) free() stuff
+	EVP_PKEY_free(dh_keys_);
+	delete[] dh_secret_;
+	delete[] md_key_;
+	delete[] cipher_key_;
+	EVP_PKEY_free(dh_public_peer_key_);
+	EVP_MD_CTX_free(md_ctx_);
+	EVP_CIPHER_CTX_free(cipher_ctx_);
 }
 
 bool SecurityModule::initialize(boost::shared_array<uint8_t> &dh_public_key,
     size_t &dh_public_key_len, PeerKeyRetrievedFunc &peerKeyRetrievedCallback)
 {
-
 	ROS_ASSERT(!dh_keys_);
-	ROS_ASSERT(!dh_public_peer_key_);
 
-	if (!dhInitialize())
+	if (!dhInitialize()
+	    || !dhSerialize(dh_keys_, dh_public_key, dh_public_key_len))
 	{
 		ERR_print_errors_cb(errorHandler, nullptr);
 		return false;
 	}
 
-	ROS_ASSERT(dh_keys_);
-
-	if (!dhSerialize(dh_keys_, dh_public_key, dh_public_key_len))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	ROS_ASSERT(dh_keys_);
-
-	peerKeyRetrievedCallback = boost::bind(&SecurityModule::onPeerKeyReceived, this,
+	peerKeyRetrievedCallback = boost::bind(&SecurityModule::onDhPeerKeyAvailable, this,
 	    _1, _2);
 
 	return true;
 }
 
 bool SecurityModule::initialize(boost::shared_array<uint8_t> &dh_public_key,
-    size_t &dh_public_key_len, boost::shared_array<uint8_t> dh_peer_key,
+    size_t &dh_public_key_len, const boost::shared_array<uint8_t>& dh_peer_key,
     size_t dh_peer_key_len)
 {
+
 	ROS_ASSERT(!dh_keys_);
 
 	if (!dhInitialize(dh_peer_key.get(), dh_peer_key_len))
@@ -92,7 +94,7 @@ bool SecurityModule::initialize(boost::shared_array<uint8_t> &dh_public_key,
 	ROS_ASSERT(dh_keys_);
 	ROS_ASSERT(dh_public_peer_key_);
 
-	if (!dhSetPeerKey()
+	if (!onDhPeerKey()
 	    || !dhSerialize(dh_keys_, dh_public_key, dh_public_key_len))
 	{
 		ERR_print_errors_cb(errorHandler, nullptr);
@@ -102,20 +104,20 @@ bool SecurityModule::initialize(boost::shared_array<uint8_t> &dh_public_key,
 	return true;
 }
 
-
-
 bool SecurityModule::dhInitialize()
 {
 	EVP_PKEY *dh_params = nullptr;
 	if (!(dh_params = EVP_PKEY_new())
 	    || (1 != EVP_PKEY_set1_DH(dh_params, DH_get_2048_256()))
-	    || !dhExtractParams(dh_params, dh_keys_))
+	    || !dhGenerateFromParams(dh_params, dh_keys_))
 	{
-		EVP_PKEY_free(dh_params); //ok to call with null
+		ERR_print_errors_cb(errorHandler, nullptr);
+		EVP_PKEY_free(dh_params);
 		return false;
 	}
 
 	EVP_PKEY_free(dh_params);
+
 	return true;
 }
 
@@ -127,55 +129,136 @@ bool SecurityModule::dhInitialize(const uint8_t *dh_peer_key,
 	EVP_PKEY *peer_key = nullptr;
 
 	if (!(peer_key = d2i_PUBKEY(nullptr, &dh_peer_key_proxy, dh_peer_key_len)))
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
 		return false;
+	}
 
 	dh_public_peer_key_ = peer_key;
 
 	EVP_PKEY *peer_derived_params = EVP_PKEY_new();
 	if (!peer_derived_params
 	    || (1 != EVP_PKEY_set1_DH(peer_derived_params, EVP_PKEY_get1_DH(peer_key)))
-	    //TODO(nmf) refactoring
-	    //|| !generateDhFromParams(peer_derived_params))
-	    || !dhExtractParams(peer_derived_params, dh_keys_))
+	    || !dhGenerateFromParams(peer_derived_params, dh_keys_))
 	{
+		ERR_print_errors_cb(errorHandler, nullptr);
 		EVP_PKEY_free(dh_public_peer_key_);
 		EVP_PKEY_free(peer_derived_params);
 		return false;
 	}
 
 	EVP_PKEY_free(peer_derived_params);
+
 	return true;
 }
 
+bool SecurityModule::dhParseKey(const uint8_t *dh_peer_key,
+    size_t dh_peer_key_size)
+{
+	const uint8_t *dh_peer_key_proxy = dh_peer_key;
+	EVP_PKEY *peer_key = nullptr;
 
-// TODO(nmf) to static
+	if (!(peer_key = d2i_PUBKEY(nullptr, &dh_peer_key_proxy, dh_peer_key_size)))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool SecurityModule::setCryptoOps()
+{
+	setHmacs(flags_ & HMACS);
+	setEncryption(flags_ & ENCRYPTION);
+
+	return (md_algorithm_ && evp_cipher_);
+}
+
+SecurityModule& SecurityModule::setHmacs(bool enable)
+{
+	const EVP_MD *md_algo = nullptr;
+
+	if (enable)
+	{
+		flags_ |= HMACS;
+		md_algo = EVP_sha256();
+	} else
+	{
+		flags_ &= ~HMACS;
+		md_algo = EVP_md_null();
+	}
+
+	if (!md_algo)
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
+	}
+	else
+	{
+		md_algorithm_ = md_algo;
+		md_len_ = EVP_MD_size(md_algorithm_);
+		md_key_size_ = EVP_MD_block_size(md_algorithm_);
+	}
+
+	return *this;
+}
+
+SecurityModule& SecurityModule::setEncryption(bool enable)
+{
+	const EVP_CIPHER *evp_cipher_aux = nullptr;
+
+	if (enable)
+	{
+		flags_ |= ENCRYPTION;
+		evp_cipher_aux = EVP_aes_256_cbc();
+	} else
+	{
+		flags_ &= ~ENCRYPTION;
+		evp_cipher_aux = EVP_enc_null();
+	}
+
+	if (!evp_cipher_aux)
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
+	}
+	else
+	{
+		evp_cipher_ = evp_cipher_aux;
+	}
+
+	return *this;
+}
+
+
 bool SecurityModule::dhSerialize(EVP_PKEY *dh_key,
     boost::shared_array<uint8_t> &dh_key_ser, size_t &dh_key_ser_size)
 {
 	ROS_ASSERT(dh_key);
 
-	uint32_t aux_size = 0;
-	if (0 >= (aux_size = i2d_PUBKEY(dh_key, NULL)))
+	uint32_t out_len = 0;
+	if (0 >= (out_len = i2d_PUBKEY(dh_key, NULL)))
+	{
 		return false;
+	}
 
-	dh_key_ser = boost::shared_array<uint8_t>(new uint8_t[aux_size]);
+	dh_key_ser = boost::shared_array<uint8_t>(new uint8_t[out_len]);
 	// note: i2d_ moves the pointer to the end of the data
 	uint8_t *aux = dh_key_ser.get();
 
-	if (0 >= (aux_size = i2d_PUBKEY(dh_key, &aux)))
+	if (0 >= (out_len = i2d_PUBKEY(dh_key, &aux)))
+	{
 		return false;
+	}
 
-	dh_key_ser_size = aux_size;
+	dh_key_ser_size = out_len;
 
 	return true;
 }
 
 
-// TODO (nmf) validate DH params
-bool SecurityModule::onPeerKeyReceived(boost::shared_array<uint8_t> peer_key,
+// TODO (nmf) handle differently + validate DH params
+bool SecurityModule::onDhPeerKeyAvailable(boost::shared_array<uint8_t> peer_key,
     size_t peer_key_len)
 {
-	ROS_ASSERT(!is_initialized);
 	ROS_ASSERT(dh_keys_);
 
 	const unsigned char *aux_buff_ptr = peer_key.get();
@@ -188,20 +271,17 @@ bool SecurityModule::onPeerKeyReceived(boost::shared_array<uint8_t> peer_key,
 
 	dh_public_peer_key_ = peer_key_ptr;
 
-	if (!dhSetPeerKey())
+	if (!onDhPeerKey())
 	{
 		ERR_print_errors_cb(errorHandler, nullptr);
 		return false;
 	}
 
-	ROS_ASSERT(is_initialized);
-
 	return true;
 }
 
 
-// TODO(nmf) to static
-bool SecurityModule::dhExtractParams(EVP_PKEY *dh_params,
+bool SecurityModule::dhGenerateFromParams(EVP_PKEY *dh_params,
     EVP_PKEY* &dh_keys)
 {
 	EVP_PKEY_CTX *pk_ctx = nullptr;
@@ -219,10 +299,11 @@ bool SecurityModule::dhExtractParams(EVP_PKEY *dh_params,
 	return true;
 }
 
-bool SecurityModule::dhSetPeerKey()
+bool SecurityModule::onDhPeerKey()
 {
 	ROS_ASSERT(dh_keys_);
 	ROS_ASSERT(dh_public_peer_key_);
+
 
 	EVP_PKEY_CTX *pkey_ctx = nullptr;
 	size_t shared_secret_len = 0;
@@ -239,26 +320,95 @@ bool SecurityModule::dhSetPeerKey()
 		return false;
 	}
 
+	dh_secret_len_ = shared_secret_len;
 	dh_secret_ = new uint8_t[shared_secret_len];
 	memcpy(dh_secret_, shared_secret, shared_secret_len);
-	OPENSSL_free(shared_secret);
-	dh_secret_size_ = shared_secret_len;
 
-	if (!deriveSha256HmacKey() || !deriveAes256EncryptionKey())
+	OPENSSL_clear_free(shared_secret, shared_secret_len);
+
+	if (!setCryptoOps() || !deriveSha256HmacKey() || !deriveAes256EncryptionKey())
 		return false;
 
-	is_initialized = true;
+	if (!(md_pkey_ = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, md_key_,
+	    md_key_size_)))
+		return false;
+
+	if (!(md_ctx_ = EVP_MD_CTX_new()) || !(cipher_ctx_ = EVP_CIPHER_CTX_new()))
+	{
+		EVP_MD_CTX_free(md_ctx_);
+		EVP_CIPHER_CTX_free(cipher_ctx_);
+		ERR_print_errors_cb(errorHandler, nullptr);
+		return false;
+	}
 
 	return true;
 }
 
+
+bool SecurityModule::secure(const uint8_t *in_data, uint32_t in_len,
+    boost::shared_array<uint8_t> &out_buffer, uint32_t &out_written,
+    uint32_t out_offset)
+{
+
+	ROS_ASSERT(md_algorithm_);
+	ROS_ASSERT(evp_cipher_);
+	ROS_ASSERT(in_data);
+	ROS_ASSERT(in_len > 0);
+
+	if (!aes256Encrypt(in_data, in_len, out_buffer, out_written,
+	    out_offset + md_len_))
+	{
+		return false;
+	}
+
+	const uint8_t *in_hmac_data = out_buffer.get() + out_offset + md_len_;
+	uint32_t in_hmac_data_len = out_written;
+	if (!mdGenerate(in_hmac_data, in_hmac_data_len, out_buffer, out_offset))
+	{
+		return false;
+	}
+
+	out_written += md_len_;
+
+	return true;
+}
+
+bool SecurityModule::retrieve(const uint8_t *in_data, uint32_t in_len,
+    boost::shared_array<uint8_t> &out_buffer, uint32_t &out_written,
+    uint32_t out_offset)
+{
+	ROS_ASSERT(md_algorithm_);
+	ROS_ASSERT(evp_cipher_);
+	ROS_ASSERT(in_data);
+	ROS_ASSERT(in_len > 0);
+
+	if (!mdValidate(in_data + md_len_, in_len - md_len_, in_data))
+	{
+		return false;
+	}
+
+	if (!aes256Decrypt(in_data + md_len_, in_len - md_len_, out_buffer,
+	    out_written, out_offset))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/******************************************************************************
+ * (Private) Secure/Retrieve Methods
+ *****************************************************************************/
+
 bool SecurityModule::deriveSha256HmacKey()
 {
 	ROS_ASSERT(dh_secret_);
-	ROS_ASSERT(!hmac_key_);
+	ROS_ASSERT(!md_key_);
+	ROS_ASSERT(md_algorithm_);
 
-	hmac_key_size_ = EVP_MD_size(EVP_sha256());
-	hmac_key_ = new uint8_t[hmac_key_size_];
+	md_key_size_ = EVP_MD_size(EVP_sha256());
+	md_key_ = new uint8_t[md_key_size_];
 
 	//TODO(nmf) currently dummy values -> set proper (preferably not hard coded)
 	uint8_t *hmac_salt = (uint8_t*) "hmac_salt";
@@ -267,13 +417,13 @@ bool SecurityModule::deriveSha256HmacKey()
 	size_t hmac_info_size = strlen((char*) hmac_info);
 
 	if (!hkdfDeriveKey(hmac_salt, hmac_salt_size, hmac_info, hmac_info_size,
-	    hmac_key_, hmac_key_size_))
+	    md_key_, md_key_size_))
 	{
-		hmac_key_ = nullptr;
+		md_key_ = nullptr;
 		return false;
 	}
 
-	ROS_ASSERT(hmac_key_);
+	ROS_ASSERT(md_key_);
 
 	return true;
 }
@@ -281,10 +431,10 @@ bool SecurityModule::deriveSha256HmacKey()
 bool SecurityModule::deriveAes256EncryptionKey()
 {
 	ROS_ASSERT(dh_secret_);
-	ROS_ASSERT(!encryption_key_);
+	ROS_ASSERT(!cipher_key_);
 
-	encryption_key_size_ = EVP_CIPHER_key_length(EVP_aes_256_cbc());
-	encryption_key_ = new uint8_t[encryption_key_size_];
+	size_t cipher_key_size = EVP_CIPHER_key_length(EVP_aes_256_cbc());
+	cipher_key_ = new uint8_t[cipher_key_size];
 
 	//TODO(nmf) currently dummy values -> set proper (preferably not hard coded)
 	uint8_t *encryption_salt = (uint8_t*) "encryption_salt";
@@ -293,145 +443,17 @@ bool SecurityModule::deriveAes256EncryptionKey()
 	size_t encryption_info_size = strlen((char*) encryption_info);
 
 	if (!hkdfDeriveKey(encryption_salt, encryption_salt_size, encryption_info,
-	    encryption_info_size, encryption_key_, encryption_key_size_))
+	    encryption_info_size, cipher_key_, cipher_key_size))
 	{
-		encryption_key_ = nullptr;
+		cipher_key_ = nullptr;
 		return false;
 	}
 
-	ROS_ASSERT(encryption_key_);
+
+	ROS_ASSERT(cipher_key_);
 
 	return true;
 }
-
-
-
-
-bool SecurityModule::hmacSha256Generate(const uint8_t *data, size_t data_size,
-    uint8_t *md_value, uint32_t &md_len) {
-
-	HMAC(EVP_sha256(), hmac_key_, hmac_key_size_, data, data_size, md_value,
-	    &md_len);
-
-	//TODO(nmf) review this assert
-	ROS_ASSERT(md_len == (uint32_t )EVP_MD_size(EVP_sha256()));
-
-	return true;
-}
-
-bool SecurityModule::secure(boost::shared_array<uint8_t> plain_data,
-    uint32_t plain_data_size, uint32_t plain_data_offset,
-    boost::shared_array<uint8_t> &secure_data, uint32_t &secure_data_size,
-    uint32_t secure_data_offset)
-{
-	static uint32_t md_size = EVP_MD_size(EVP_sha256());
-	static uint32_t cipher_block_size = EVP_CIPHER_block_size(EVP_aes_256_cbc());
-	static uint32_t iv_size = cipher_block_size;
-
-	// secure data format: [ secure_data_offset | hmac | iv | cyphertext ]
-	uint32_t hmac_offset = secure_data_offset;
-	uint32_t iv_offset = hmac_offset + md_size;
-	uint32_t ciphertext_offset = iv_offset + iv_size;
-	// must account for padding
-	uint32_t max_ciphertext_size = (plain_data_size / cipher_block_size)
-	    * cipher_block_size
-	    + cipher_block_size;
-
-	uint32_t buffer_size = ciphertext_offset + max_ciphertext_size;
-	secure_data = boost::shared_array<uint8_t>(new uint8_t[buffer_size]);
-
-	// write iv
-	if (1 != RAND_bytes(secure_data.get() + iv_offset, cipher_block_size))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	// write ciphertext
-	uint32_t ciphertext_len = 0;
-	if (!encrypt(plain_data.get() + plain_data_offset, plain_data_size,
-	    secure_data.get() + iv_offset, secure_data.get() + ciphertext_offset,
-	    ciphertext_len))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	// write hmac(ciphertext)
-	uint32_t md_len = 0;
-	if (!hmacSha256Generate(secure_data.get() + ciphertext_offset, ciphertext_len,
-	    secure_data.get() + hmac_offset, md_len))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	secure_data_size = md_size + iv_size + ciphertext_len;
-
-	return true;
-}
-
-
-bool SecurityModule::retrieve(boost::shared_array<uint8_t> secure_data,
-    uint32_t secure_data_size, uint32_t secure_data_offset,
-    boost::shared_array<uint8_t> &plain_data, uint32_t &plain_data_size,
-    uint32_t plain_data_offset) {
-
-	ROS_ASSERT(secure_data);
-	ROS_ASSERT(secure_data_size > secure_data_offset);
-
-	static uint32_t md_size = EVP_MD_size(EVP_sha256());
-	static uint32_t cipher_block_size = EVP_CIPHER_block_size(EVP_aes_256_cbc());
-	static uint32_t iv_size = cipher_block_size;
-
-	// secure data format: [ secure_data_offset | hmac | iv | cyphertext ]
-	uint32_t hmac_offset = secure_data_offset;
-	uint32_t iv_offset = hmac_offset + md_size;
-	uint32_t ciphertext_offset = iv_offset + iv_size;
-	uint32_t ciphertext_size = secure_data_size - iv_size - md_size;
-	uint32_t max_plaintext_size = (ciphertext_size / cipher_block_size)
-	    * cipher_block_size
-	    + cipher_block_size;
-
-	uint32_t buffer_size = plain_data_offset + max_plaintext_size;
-	plain_data = boost::shared_array<uint8_t>(new uint8_t[buffer_size]);
-
-	uint8_t md_val[md_size];
-	uint32_t md_len = 0;
-
-	// verify hmac(ciphertext)
-	if (!hmacSha256Generate(secure_data.get() + ciphertext_offset,
-	    ciphertext_size, md_val, md_len))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	if (0
-	    != CRYPTO_memcmp(md_val, secure_data.get() + hmac_offset,
-	    		md_size))
-	{
-		ROS_INFO("Dropping received message: failed integrity check");
-		return false;
-	}
-
-	// recover plaintext
-	uint32_t plain_data_len = 0;
-	if (!decrypt(secure_data.get() + ciphertext_offset, ciphertext_size,
-	    secure_data.get() + iv_offset, plain_data.get() + plain_data_offset,
-	    plain_data_len))
-	{
-		ERR_print_errors_cb(errorHandler, nullptr);
-		return false;
-	}
-
-	plain_data_size = plain_data_len;
-
-	return true;
-}
-
-
-
 
 bool SecurityModule::hkdfDeriveKey(const uint8_t *salt, size_t salt_size,
     const uint8_t *info, size_t info_size, uint8_t *key, size_t key_size)
@@ -445,7 +467,7 @@ bool SecurityModule::hkdfDeriveKey(const uint8_t *salt, size_t salt_size,
 	if (!(hkdf_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL))
 	    || (1 != EVP_PKEY_derive_init(hkdf_ctx))
 	    || (1 != EVP_PKEY_CTX_set_hkdf_md(hkdf_ctx, EVP_sha256()))
-	    || (1 != EVP_PKEY_CTX_set1_hkdf_key(hkdf_ctx, dh_secret_, dh_secret_size_))
+	    || (1 != EVP_PKEY_CTX_set1_hkdf_key(hkdf_ctx, dh_secret_, dh_secret_len_))
 	    || (1 != EVP_PKEY_CTX_set1_hkdf_salt(hkdf_ctx, salt, salt_size))
 	    || (1 != EVP_PKEY_CTX_add1_hkdf_info(hkdf_ctx, info, info_size))
 	    || (1 != EVP_PKEY_derive(hkdf_ctx, derived_key, &derived_key_size)))
@@ -463,86 +485,164 @@ bool SecurityModule::hkdfDeriveKey(const uint8_t *salt, size_t salt_size,
 	return true;
 }
 
-// TODO(nmf) look into reusing context
-bool SecurityModule::encrypt(uint8_t *plaintext, int plaintext_len, uint8_t *iv,
-    uint8_t *ciphertext, uint32_t &ciphertext_len)
+bool SecurityModule::mdGenerate(const uint8_t *msg, uint32_t msg_len,
+    boost::shared_array<uint8_t>& md, uint32_t md_offset)
 {
-	static const EVP_CIPHER *cipher = EVP_aes_256_cbc();
+	if (!md)
+		md = boost::shared_array<uint8_t>(new uint8_t[md_offset + md_len_]);
 
-	EVP_CIPHER_CTX *cipher_ctx = nullptr;
-	int tmp_len = 0;
-	int len = 0;
+	size_t md_len;
 
-	if (!(cipher_ctx = EVP_CIPHER_CTX_new())
-	    || (1
-	        != EVP_EncryptInit_ex(cipher_ctx, cipher, NULL,
-	            encryption_key_, iv))
-	    || (1
-	        != EVP_EncryptUpdate(cipher_ctx, ciphertext, &tmp_len,
-	            plaintext,
-	            plaintext_len)))
+	if (1 != EVP_DigestInit_ex(md_ctx_, md_algorithm_, NULL)
+	    || 1
+	        != EVP_DigestSignInit(md_ctx_, nullptr, md_algorithm_, nullptr,
+	            md_pkey_) || 1 != EVP_DigestSignUpdate(md_ctx_, msg, msg_len)
+	    || 1 != EVP_DigestSignFinal(md_ctx_, md.get() + md_offset, &md_len))
 	{
-		EVP_CIPHER_CTX_free(cipher_ctx);
+		ERR_print_errors_cb(errorHandler, nullptr);
 		return false;
 	}
-	len = tmp_len;
+
+	ROS_ASSERT(md_len == md_len_);
+
+	return true;
+}
+
+bool SecurityModule::mdValidate(const uint8_t *msg, uint32_t msg_len,
+    const uint8_t* md)
+{
+	boost::shared_array<uint8_t> md_tmp = boost::shared_array<uint8_t>(
+	    new uint8_t[md_len_]);
+
+	if (!mdGenerate(msg, msg_len, md_tmp))
+	{
+		return false;
+	}
+
+	if (0 != CRYPTO_memcmp(md_tmp.get(), md, md_len_))
+	{
+		ROS_DEBUG_NAMED("superdebug", "HMAC Verify: failed integrity check");
+		return false;
+	}
+
+	return true;
+}
+
+
+bool SecurityModule::aes256Encrypt(const uint8_t *plaintext,
+    uint32_t plaintext_size, boost::shared_array<uint8_t> &buffer,
+    uint32_t &size, uint32_t offset)
+{
+	uint32_t cipher_block_size = EVP_CIPHER_block_size(evp_cipher_);
+	uint32_t iv_size = EVP_CIPHER_iv_length(evp_cipher_);
+
+	if (!buffer)
+	{
+		// take padding into account
+		uint32_t max_ciphertext_size = (plaintext_size / cipher_block_size)
+		    * cipher_block_size + cipher_block_size;
+		uint32_t buffer_size = offset + iv_size + max_ciphertext_size;
+		buffer = boost::shared_array<uint8_t>(new uint8_t[buffer_size]);
+	}
+
+	uint8_t *iv = buffer.get() + offset;
+	uint8_t *ciphertext = iv + iv_size;
+
+	// new random IV for this encryption
+	if (1 != RAND_bytes(iv, iv_size))
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
+		return false;
+	}
+
+	uint32_t ciphertext_len = 0;
+	if (!evp_cipher(plaintext, plaintext_size, ciphertext, ciphertext_len, iv,
+	    true))
+	{
+		return false;
+	}
+
+	size = iv_size + ciphertext_len;
+
+	return true;
+}
+
+bool SecurityModule::aes256Decrypt(const uint8_t *ciphered_data,
+    uint32_t ciphered_data_len, boost::shared_array<uint8_t> &buffer,
+    uint32_t &size, uint32_t offset)
+{
+	uint32_t cipher_block_size = EVP_CIPHER_block_size(evp_cipher_);
+	uint32_t iv_size = EVP_CIPHER_iv_length(evp_cipher_);
+
+	const uint8_t *iv = ciphered_data;
+	const uint8_t *ciphertext = iv + iv_size;
+
+	uint32_t ciphertext_size = ciphered_data_len - iv_size;
+
+	if (!buffer)
+	{
+		// account for padding
+		uint32_t max_plaintext_size = (ciphertext_size / cipher_block_size)
+		    * cipher_block_size + cipher_block_size;
+		uint32_t buffer_size = offset + max_plaintext_size;
+		buffer = boost::shared_array<uint8_t>(new uint8_t[buffer_size]);
+	}
+
+	uint32_t decrypt_len = 0;
+	if (!evp_cipher(ciphertext, ciphertext_size, buffer.get() + offset,
+	    decrypt_len, iv, false))
+	{
+		return false;
+	}
+
+	size = decrypt_len;
+
+	return true;
+}
+
+bool SecurityModule::evp_cipher(const uint8_t *input, int input_len,
+    uint8_t *output, uint32_t &output_len, const uint8_t *iv, bool encrypt)
+{
+
+	int key_length = EVP_CIPHER_key_length(evp_cipher_);
+	int iv_length = EVP_CIPHER_iv_length(evp_cipher_);
+	int do_encrypt = encrypt ? 1 : 0;
 
 	if (1
-	    != EVP_EncryptFinal_ex(cipher_ctx, ciphertext + len, &tmp_len))
+	    != (EVP_CipherInit_ex(cipher_ctx_, evp_cipher_, NULL, NULL, NULL,
+	        do_encrypt)))
 	{
-		EVP_CIPHER_CTX_free(cipher_ctx);
+		ERR_print_errors_cb(errorHandler, nullptr);
 		return false;
 	}
 
-	len += tmp_len;
-	ciphertext_len = len;
+	ROS_ASSERT(EVP_CIPHER_CTX_key_length(cipher_ctx_) == key_length);
+	ROS_ASSERT(EVP_CIPHER_CTX_iv_length(cipher_ctx_) == iv_length);
 
-	/* Clean up */
-	EVP_CIPHER_CTX_free(cipher_ctx);
+	int tmp_len = 0, current_len = 0;
+
+	if ((1
+	    != EVP_CipherInit_ex(cipher_ctx_, evp_cipher_, NULL, cipher_key_, iv,
+	            do_encrypt))
+	|| (1 != EVP_CipherUpdate(cipher_ctx_, output, &tmp_len, input, input_len)))
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
+		return false;
+	}
+
+	current_len = tmp_len;
+
+	if (1 != EVP_CipherFinal_ex(cipher_ctx_, output + current_len, &tmp_len))
+	{
+		ERR_print_errors_cb(errorHandler, nullptr);
+		return false;
+	}
+
+	current_len += tmp_len;
+	output_len = current_len;
 
 	return true;
 }
-
-// TODO(nmf) look into reusing context
-bool SecurityModule::decrypt(uint8_t *ciphertext, uint32_t ciphertext_len,
-    uint8_t *iv,
-    uint8_t *plaintext, uint32_t &plaintext_len)
-{
-	static const EVP_CIPHER *cipher = EVP_aes_256_cbc();
-
-	EVP_CIPHER_CTX *cipher_ctx = nullptr;
-	int tmp_len = 0;
-	int len = 0;
-
-	if (!(cipher_ctx = EVP_CIPHER_CTX_new())
-	    || (1
-	        != EVP_DecryptInit_ex(cipher_ctx, cipher, NULL,
-	            encryption_key_, iv))
-	    || (1
-	        != EVP_DecryptUpdate(cipher_ctx, plaintext, &tmp_len, ciphertext,
-	            ciphertext_len)))
-	{
-		EVP_CIPHER_CTX_free(cipher_ctx);
-		return false;
-	}
-
-	len += tmp_len;
-
-	if (1 != EVP_DecryptFinal_ex(cipher_ctx, plaintext + len, &tmp_len))
-	{
-		EVP_CIPHER_CTX_free(cipher_ctx);
-		return false;
-	}
-
-	len += tmp_len;
-	plaintext_len = len;
-
-	/* Clean up */
-	EVP_CIPHER_CTX_free(cipher_ctx);
-
-	return true;
-}
-
 
 } //namespace ros
 

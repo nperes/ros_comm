@@ -96,7 +96,7 @@ public:
       return false;
     }
 
-    const std::string& val = it->second;
+		const std::string& val = it->second;
     if (val == "true")
     {
       return true;
@@ -105,13 +105,75 @@ public:
     return false;
   }
 
+	/**
+	 * \brief If a TCP transport is used, specifies whether or not to use HMACs
+	 * 	to enable integrity-checks over the data being transmitted.
+	 *
+	 * \param hmacs [optional] Whether or not to use HMACS.  Defaults to true.
+	 */
+	TransportHints& hmacs(bool hmacs_ = true)
+	{
+		options_["hmacs"] = hmacs_ ? "true" : "false";
+		return *this;
+	}
+
+	/**
+	 * \brief Returns whether or not this TransportHints has specified the
+	 * HMACs option
+	 */
+	bool getHmacs()
+	{
+		M_string::iterator it = options_.find("hmacs");
+		if (it == options_.end())
+			return false;
+
+		const std::string& val = it->second;
+		if (val == "true")
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * \brief If a TCP transport is used, specifies whether or not to use
+	 *  encrypt the data being transmitted.
+	 *
+	 * \param hmacs [optional] Whether or not to use encryption. Defaults to true.
+	 */
+	TransportHints& encrypt(bool encrypt_ = true)
+	{
+		options_["encrypt"] = encrypt_ ? "true" : "false";
+		return *this;
+	}
+
+	/**
+	 * \brief Returns whether or not this TransportHints has specified the use
+	 * of encryption.
+	 */
+	bool getEncrypt()
+	{
+		M_string::iterator it = options_.find("encrypt");
+		if (it == options_.end())
+			return false;
+
+		const std::string& val = it->second;
+		if (val == "true")
+		{
+			return true;
+		}
+
+		return false;
+	}
+
   /**
    * \brief If a UDP transport is used, specifies the maximum datagram size.
    *
    * \param size The size, in bytes
-   */
+	 */
   TransportHints& maxDatagramSize(int size)
-  {
+	{
     options_["max_datagram_size"] = boost::lexical_cast<std::string>(size);
     return *this;
   }
